@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass
+from typing import Any
 from xml.etree import ElementTree as ET
 
 
@@ -100,34 +101,60 @@ class CPACSConfiguration:
 
 @dataclass
 class TixiDocument:
-    """Lightweight TiXI document stub."""
+    """Lightweight TiXI document stub with optional real TiXI handle."""
 
     xml_content: str
     file_name: str | None = None
     closed: bool = False
+    _tixi_handle: Any | None = None  # tixi3wrapper.Tixi3 instance when available
 
     def close(self) -> None:
-        """Mark the document as closed."""
+        """Close the document (and underlying TiXI handle if present)."""
+        if self._tixi_handle is not None and hasattr(self._tixi_handle, "close"):
+            try:
+                self._tixi_handle.close()
+            except Exception:  # noqa: BLE001 - best-effort cleanup
+                pass
         self.closed = True
+
+    @property
+    def handle(self) -> Any:
+        """Return the underlying TiXI handle, or ``None`` in stub mode."""
+        return self._tixi_handle
 
 
 @dataclass
 class TiglConfiguration:
-    """Lightweight TiGL configuration stub."""
+    """Lightweight TiGL configuration stub with optional real TiGL handle."""
 
     cpacs_configuration: CPACSConfiguration
     closed: bool = False
+    _tigl_handle: Any | None = None  # tigl3wrapper.Tigl3 instance when available
 
     def close(self) -> None:
-        """Mark the configuration as closed."""
+        """Close the configuration (and underlying TiGL handle if present)."""
+        if self._tigl_handle is not None and hasattr(self._tigl_handle, "close"):
+            try:
+                self._tigl_handle.close()
+            except Exception:  # noqa: BLE001 - best-effort cleanup
+                pass
         self.closed = True
+
+    @property
+    def handle(self) -> Any:
+        """Return the underlying TiGL handle, or ``None`` in stub mode."""
+        return self._tigl_handle
 
     def getWingCount(self) -> int:  # noqa: N802 - mimic TiGL naming
         """Return the number of wings in the configuration."""
+        if self._tigl_handle is not None:
+            return self._tigl_handle.getWingCount()  # type: ignore[no-any-return]
         return len(self.cpacs_configuration.wings)
 
     def getFuselageCount(self) -> int:  # noqa: N802 - mimic TiGL naming
         """Return the number of fuselages in the configuration."""
+        if self._tigl_handle is not None:
+            return self._tigl_handle.getFuselageCount()  # type: ignore[no-any-return]
         return len(self.cpacs_configuration.fuselages)
 
     def getRotorCount(self) -> int:  # noqa: N802 - mimic TiGL naming
@@ -136,6 +163,8 @@ class TiglConfiguration:
 
     def getEngineCount(self) -> int:  # noqa: N802 - mimic TiGL naming
         """Return the number of engines in the configuration."""
+        if self._tigl_handle is not None and hasattr(self._tigl_handle, "getEngineCount"):
+            return self._tigl_handle.getEngineCount()  # type: ignore[no-any-return]
         return len(self.cpacs_configuration.engines)
 
 

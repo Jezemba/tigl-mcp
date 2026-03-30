@@ -29,6 +29,11 @@ Issues = "https://github.com/cmudrc/tigl-mcp/issues"
 Documentation = "https://cmudrc.github.io/tigl-mcp/"
 
 [project.optional-dependencies]
+geometry = [
+  "tigl3",
+  "tixi3",
+  "gmsh",
+]
 dev = [
   "pytest>=7.4",
   "pytest-cov>=4.1",

@@ -61,19 +61,33 @@ def open_cpacs_tool(session_manager: SessionManager) -> ToolDefinition:
                 tixi_module = cast(Any, tixi3wrapper)
                 tigl_module = cast(Any, tigl3wrapper)
 
-                tixi_handle: Any = tixi_module.Tixi3()
-                if hasattr(tixi_handle, "openString"):
-                    tixi_handle.openString(xml_content)
-                elif hasattr(tixi_handle, "openDocumentFromString"):
-                    tixi_handle.openDocumentFromString(xml_content)
+                real_tixi: Any = tixi_module.Tixi3()
+                if hasattr(real_tixi, "openString"):
+                    real_tixi.openString(xml_content)
+                elif hasattr(real_tixi, "openDocumentFromString"):
+                    real_tixi.openDocumentFromString(xml_content)
                 else:
                     raise_mcp_error(
                         "OpenError",
                         "No supported TIXI open-from-string API found.",
                     )
 
-                tigl_handle: Any = tigl_module.Tigl3()
-                tigl_handle.open(tixi_handle, "")
+                real_tigl: Any = tigl_module.Tigl3()
+                real_tigl.open(real_tixi, "")
+
+                # Wrap the real handles in our dataclass wrappers so the rest
+                # of the server can access both parsed config and native API.
+                from tigl_mcp.cpacs import TiglConfiguration, TixiDocument
+
+                tixi_handle: Any = TixiDocument(
+                    xml_content=xml_content,
+                    file_name=file_name,
+                    _tixi_handle=real_tixi,
+                )
+                tigl_handle: Any = TiglConfiguration(
+                    cpacs_configuration=cpacs_config,
+                    _tigl_handle=real_tigl,
+                )
             else:
                 tixi_handle, tigl_handle, _, _ = build_handles(xml_content, file_name)
 

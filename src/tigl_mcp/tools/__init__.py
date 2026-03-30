@@ -28,6 +28,7 @@ from tigl_mcp.tools.sampling import (
     intersect_with_plane_tool,
     sample_component_surface_tool,
 )
+from tigl_mcp.tools.volume_mesh import generate_volume_mesh_tool
 
 
 def build_tools(session_manager: SessionManager) -> list[ToolDefinition]:
@@ -48,4 +49,5 @@ def build_tools(session_manager: SessionManager) -> list[ToolDefinition]:
         export_configuration_cad_tool(session_manager),
         get_high_level_parameters_tool(session_manager),
         set_high_level_parameters_tool(session_manager),
+        generate_volume_mesh_tool(session_manager),
     ]

@@ -113,7 +113,9 @@ def _export_su2_via_tigl(
     try:
         meshio_module: Any = import_module("meshio")
         if _has_real_tigl_exports(tigl_handle):
-            stl_bytes = _export_stl_bytes_via_tigl3(tigl_handle, component)
+            stl_bytes = _export_stl_bytes_via_tigl3(
+                _resolve_native_handle(tigl_handle), component
+            )
         else:
             stl_bytes = _synthetic_mesh_bytes("stl", component)
     except MCPError:
@@ -213,22 +215,37 @@ def _synthetic_mesh_bytes(
 
 def _has_real_tigl_exports(tigl_handle: object) -> bool:
     """Check whether the handle has real TiGL export methods (vs stub)."""
+    # Check both the wrapper and the inner native handle.
+    inner = getattr(tigl_handle, "_tigl_handle", None)
+    targets = (tigl_handle,) if inner is None else (tigl_handle, inner)
     export_methods = (
         "exportMeshedWingSTL",
         "exportMeshedGeometrySTL",
         "exportFusedSTEP",
     )
-    return any(callable(getattr(tigl_handle, name, None)) for name in export_methods)
+    return any(
+        callable(getattr(t, name, None))
+        for t in targets
+        for name in export_methods
+    )
+
+
+def _resolve_native_handle(tigl_handle: object) -> object:
+    """Return the inner native TiGL handle if present, otherwise the object itself."""
+    inner = getattr(tigl_handle, "_tigl_handle", None)
+    return inner if inner is not None else tigl_handle
 
 
 def _export_real_stl_bytes(
     tigl_handle: object, component: ComponentDefinition
 ) -> bytes:  # pragma: no cover
     """Export real STL bytes via TiGL meshed export methods."""
+    native = _resolve_native_handle(tigl_handle)
+
     if os.environ.get("TIGL_MCP_DEBUG_EXPORTS") == "1":
         keys = ("export", "step", "iges", "stp", "stl", "write", "save", "mesh")
         methods = [
-            name for name in dir(tigl_handle) if any(k in name.lower() for k in keys)
+            name for name in dir(native) if any(k in name.lower() for k in keys)
         ]
         print(
             f"[tigl-mcp][debug] tigl_handle export-ish methods: {methods}",
@@ -239,7 +256,7 @@ def _export_real_stl_bytes(
     errors: list[str] = []
 
     try:
-        stl_bytes = _export_stl_bytes_via_tigl3(tigl_handle, component)
+        stl_bytes = _export_stl_bytes_via_tigl3(native, component)
         if _looks_like_stl_payload(stl_bytes):
             return stl_bytes
         errors.append(f"shape->stl not recognized as STL ({len(stl_bytes)} B)")
@@ -543,7 +560,9 @@ def export_configuration_cad_tool(session_manager: SessionManager) -> ToolDefini
                 "utf-8"
             )
 
-            export_capable = any(
+            # Check for real TiGL handle (new-style) or legacy direct methods
+            real_handle = getattr(tigl_handle, "_tigl_handle", None)
+            export_capable = real_handle is not None or any(
                 callable(getattr(tigl_handle, name, None))
                 for name in (
                     "exportFusedSTEP",
@@ -554,8 +573,10 @@ def export_configuration_cad_tool(session_manager: SessionManager) -> ToolDefini
             )
 
             if export_capable:
+                # Delegate to the real handle when available
+                export_target = real_handle if real_handle is not None else tigl_handle
                 cad_bytes = _export_configuration_cad_bytes_via_tigl(
-                    tigl_handle, params.format
+                    export_target, params.format
                 )
                 source = "tigl"
             else:

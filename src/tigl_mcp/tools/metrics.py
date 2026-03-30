@@ -1,8 +1,15 @@
-"""Tools that compute simplified geometric metrics."""
+"""Tools that compute simplified geometric metrics.
+
+When real TiGL bindings are available the tools use native API calls
+(``wingGetSpan``, ``wingGetReferenceArea``, etc.) for accurate results.
+Otherwise they fall back to the lightweight stub calculations.
+"""
 
 from __future__ import annotations
 
-from tigl_mcp.cpacs import ComponentDefinition, CPACSConfiguration
+from typing import Any
+
+from tigl_mcp.cpacs import ComponentDefinition, CPACSConfiguration, TiglConfiguration
 from tigl_mcp.errors import MCPError, raise_mcp_error
 from tigl_mcp.session_manager import SessionManager
 from tigl_mcp.tooling import ToolDefinition, ToolParameters
@@ -33,14 +40,139 @@ def _safe_get_component(
     return component
 
 
+# ---------------------------------------------------------------------------
+# Real TiGL metric helpers (only called when _tigl_handle is not None)
+# ---------------------------------------------------------------------------
+
+
+def _get_wing_summary_real(  # pragma: no cover
+    tigl_handle: TiglConfiguration,
+    component: ComponentDefinition,
+    wing_uid: str,
+) -> dict[str, object]:
+    """Compute wing summary via the native TiGL C-API."""
+    tigl: Any = tigl_handle._tigl_handle
+
+    span: float = tigl.wingGetSpan(wing_uid)
+    half_span = span / 2.0
+
+    # TIGL_NO_SYMMETRY = 0
+    reference_area: float = tigl.wingGetReferenceArea(component.index, 0)
+
+    mac_chord: float
+    mac_x: float
+    mac_y: float
+    mac_z: float
+    mac_chord, mac_x, mac_y, mac_z = tigl.wingGetMAC(wing_uid)
+
+    top_area = reference_area * 0.5 if reference_area else None
+    aspect_ratio = (
+        (span**2) / reference_area
+        if reference_area and reference_area > 0
+        else None
+    )
+
+    try:
+        wetted_area: float | None = tigl.wingGetWettedArea(wing_uid)
+    except Exception:  # noqa: BLE001
+        wetted_area = None
+
+    try:
+        sweep: float | None = tigl.wingGetSweep(wing_uid)
+    except Exception:  # noqa: BLE001
+        sweep = component.parameters.get("sweep")
+
+    try:
+        dihedral: float | None = tigl.wingGetDihedral(wing_uid)
+    except Exception:  # noqa: BLE001
+        dihedral = component.parameters.get("dihedral")
+
+    return {
+        "span": span,
+        "half_span": half_span,
+        "reference_area": reference_area,
+        "wetted_area": wetted_area,
+        "top_area": top_area,
+        "aspect_ratio": aspect_ratio,
+        "mac_length": mac_chord,
+        "mac_quarter_chord": {"x": mac_x, "y": mac_y, "z": mac_z},
+        "sweep_deg": sweep,
+        "dihedral_deg": dihedral,
+        "symmetry": component.symmetry,
+    }
+
+
+def _get_fuselage_summary_real(  # pragma: no cover
+    tigl_handle: TiglConfiguration,
+    component: ComponentDefinition,
+) -> dict[str, object]:
+    """Compute fuselage summary via the native TiGL C-API."""
+    tigl: Any = tigl_handle._tigl_handle
+    idx = component.index
+
+    try:
+        volume: float | None = tigl.fuselageGetVolume(idx)
+    except Exception:  # noqa: BLE001
+        volume = None
+
+    try:
+        length: float | None = tigl.fuselageGetCenterLineLength(idx)
+    except Exception:  # noqa: BLE001
+        length = component.parameters.get("length", 15.0 + idx)
+
+    try:
+        wetted_area: float | None = tigl.fuselageGetWettedArea(idx)
+    except Exception:  # noqa: BLE001
+        wetted_area = None
+
+    try:
+        w: float = tigl.fuselageGetMaximalWidth(idx)
+        h: float = tigl.fuselageGetMaximalHeight(idx)
+        max_cross_section_area: float | None = w * h * 3.14159 / 4.0
+    except Exception:  # noqa: BLE001
+        max_cross_section_area = None
+
+    try:
+        max_diameter: float | None = max(
+            tigl.fuselageGetMaximalWidth(idx),
+            tigl.fuselageGetMaximalHeight(idx),
+        )
+    except Exception:  # noqa: BLE001
+        max_diameter = None
+
+    return {
+        "length": length,
+        "wetted_area": wetted_area,
+        "max_cross_section_area": max_cross_section_area,
+        "max_diameter": max_diameter,
+        "approx_volume": volume,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tool factories
+# ---------------------------------------------------------------------------
+
+
 def get_wing_summary_tool(session_manager: SessionManager) -> ToolDefinition:
     """Create the get_wing_summary tool."""
 
     def handler(raw_params: dict[str, object]) -> dict[str, object]:
         try:
             params = WingSummaryParams.model_validate(raw_params)
-            _, _, config = require_session(session_manager, params.session_id)
+            _, tigl_handle, config = require_session(session_manager, params.session_id)
             component = _safe_get_component(config, params.wing_uid, "Wing")
+
+            # Try real TiGL first
+            if tigl_handle._tigl_handle is not None:  # pragma: no cover
+                try:
+                    return _get_wing_summary_real(
+                        tigl_handle, component, params.wing_uid
+                    )
+                except Exception:  # noqa: BLE001 - fall through to stub
+                    pass
+
+            # Stub / fallback calculations
             span = component.parameters.get("span", 20.0 + component.index)
             reference_area = component.parameters.get("area", span * 0.8)
             half_span = span / 2.0
@@ -92,8 +224,17 @@ def get_fuselage_summary_tool(session_manager: SessionManager) -> ToolDefinition
     def handler(raw_params: dict[str, object]) -> dict[str, object]:
         try:
             params = FuselageSummaryParams.model_validate(raw_params)
-            _, _, config = require_session(session_manager, params.session_id)
+            _, tigl_handle, config = require_session(session_manager, params.session_id)
             component = _safe_get_component(config, params.fuselage_uid, "Fuselage")
+
+            # Try real TiGL first
+            if tigl_handle._tigl_handle is not None:  # pragma: no cover
+                try:
+                    return _get_fuselage_summary_real(tigl_handle, component)
+                except Exception:  # noqa: BLE001 - fall through to stub
+                    pass
+
+            # Stub / fallback calculations
             length = component.parameters.get("length", 15.0 + component.index)
             wetted_area = component.parameters.get("wetted_area")
             max_cross_section_area = component.parameters.get("max_cross_section_area")
