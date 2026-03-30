@@ -227,12 +227,11 @@ def get_fuselage_summary_tool(session_manager: SessionManager) -> ToolDefinition
             _, tigl_handle, config = require_session(session_manager, params.session_id)
             component = _safe_get_component(config, params.fuselage_uid, "Fuselage")
 
-            # Try real TiGL first
-            if tigl_handle._tigl_handle is not None:  # pragma: no cover
-                try:
-                    return _get_fuselage_summary_real(tigl_handle, component)
-                except Exception:  # noqa: BLE001 - fall through to stub
-                    pass
+            # NOTE: Real TiGL fuselage calls (fuselageGetVolume, etc.)
+            # segfault on some CPACS files (e.g. D150_simple.xml) — the
+            # C++ crash kills the server process before Python's try/except
+            # can catch it.  Always use stub calculations for fuselage
+            # until the upstream TiGL bug is resolved.
 
             # Stub / fallback calculations
             length = component.parameters.get("length", 15.0 + component.index)
