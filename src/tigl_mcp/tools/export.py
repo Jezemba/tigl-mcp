@@ -277,6 +277,21 @@ def _export_mesh_bytes(
 ) -> bytes:
     """Export mesh content for the requested format."""
     if mesh_format == "su2":
+        # Prefer gmsh volume mesh (has named markers: "aircraft"/"farfield")
+        # over meshio surface conversion (numeric markers only).
+        try:
+            from tigl_mcp.tools.volume_mesh import _generate_volume_mesh_gmsh, GenerateVolumeMeshParams
+            stl_bytes = _export_real_stl_bytes(tigl_handle, component) if _has_real_tigl_exports(tigl_handle) else _synthetic_mesh_bytes("stl", component)
+            params = GenerateVolumeMeshParams(
+                session_id="", component_uid=component.uid,
+                mesh_size_min=2.0, mesh_size_max=20.0,
+                surface_mesh_size=5.0, far_field_distance=5.0,
+                output_format="su2",
+            )
+            mesh_bytes, _stats = _generate_volume_mesh_gmsh(stl_bytes, params)
+            return mesh_bytes
+        except Exception:
+            pass  # Fall back to meshio path
         return _export_su2_via_tigl(tigl_handle, component)
 
     if mesh_format == "stl" and _has_real_tigl_exports(tigl_handle):
