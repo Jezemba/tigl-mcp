@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tigl-mcp"
-version = "0.2.0"
+version = "0.3.0"
 description = "An MCP around the TiGL library"
 authors = [
   { name = "The Design Research Collective", email = "ask-drc@cmu.edu" }
@@ -61,6 +61,10 @@ indent-style = "space"
 select = ["E", "F", "I", "B", "UP", "ANN", "C4", "D"]
 ignore = ["D203", "D213"]
 
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["ANN", "D"]
+"src/tigl_mcp/cpacs_adapter.py" = ["E501"]
+
 [tool.mypy]
 python_version = "3.12"
 warn_return_any = true
@@ -69,6 +73,10 @@ warn_unused_configs = true
 strict = true
 exclude = ["^build/"]
 mypy_path = "src"
+
+[[tool.mypy.overrides]]
+module = ["tigl_mcp.cpacs_adapter"]
+follow_imports = "skip"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
