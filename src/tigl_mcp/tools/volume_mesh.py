@@ -85,6 +85,78 @@ def _export_stl_for_component(
             pass
 
 
+def _export_brep_for_component(
+    tigl_handle: TiglConfiguration, component: ComponentDefinition
+) -> bytes | None:
+    """Export component as native OCC BREP using TiGL.
+
+    Prefer this over STL: the BREP is a parametric watertight CAD solid
+    that gmsh's OCC kernel imports directly. The STL path requires
+    ``BRepBuilderAPI_Sewing`` to stitch triangulation into a shell, which
+    leaks at segment boundaries on swept wings and produces meshes with
+    fluid cells inside the wing solid (Phase G.1 bug, 2026-05-18).
+
+    Returns ``None`` if the TiGL build doesn't expose the BREP exporter
+    for this component type, so callers can fall back to STL.
+    """
+    tigl: Any = tigl_handle._tigl_handle
+    if tigl is None:
+        return None
+
+    comp_type = component.type_name.lower()
+    if comp_type == "wing":
+        exporter = getattr(tigl, "exportWingBREPByUID", None)
+    elif comp_type == "fuselage":
+        exporter = getattr(tigl, "exportFuselageBREPByUID", None)
+    else:
+        return None
+
+    if exporter is None:
+        return None
+
+    with tempfile.NamedTemporaryFile(suffix=".brep", delete=False) as tmp:
+        tmp_path = tmp.name
+
+    try:
+        exporter(component.uid, tmp_path)
+        with open(tmp_path, "rb") as fh:
+            return fh.read()
+    except Exception:  # noqa: BLE001
+        return None
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _export_configuration_brep(tigl_handle: TiglConfiguration) -> bytes | None:
+    """Export the entire fused configuration as OCC BREP via TiGL.
+
+    Returns ``None`` if exportFusedBREP isn't available, so callers can
+    fall back to per-component or STL paths.
+    """
+    tigl: Any = tigl_handle._tigl_handle
+    if tigl is None:
+        return None
+    exporter = getattr(tigl, "exportFusedBREP", None)
+    if exporter is None:
+        return None
+    with tempfile.NamedTemporaryFile(suffix=".brep", delete=False) as tmp:
+        tmp_path = tmp.name
+    try:
+        exporter(tmp_path)
+        with open(tmp_path, "rb") as fh:
+            return fh.read()
+    except Exception:  # noqa: BLE001
+        return None
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def _export_configuration_stl(tigl_handle: TiglConfiguration) -> bytes:
     """Export entire configuration as a single STL file."""
     tigl: Any = tigl_handle._tigl_handle
@@ -203,13 +275,28 @@ def _stl_bytes_to_solid_brep(stl_bytes: bytes) -> str:
 def _generate_volume_mesh_gmsh(
     stl_bytes: bytes,
     params: GenerateVolumeMeshParams,
+    brep_bytes: bytes | None = None,
 ) -> tuple[bytes, dict[str, Any]]:
-    """Generate a CFD-ready volume mesh around the STL geometry.
+    """Generate a CFD-ready volume mesh around the supplied geometry.
 
-    The aircraft is converted into a watertight OCC solid and subtracted from
-    the far-field box (boolean cut) so the resulting fluid domain wraps the
-    body without including any cells inside it. This is the property
-    ``tests/test_volume_mesh_cfd_correctness.py`` pins down.
+    The aircraft is imported into gmsh's OCC kernel as a watertight solid
+    and subtracted from the far-field box (boolean cut) so the resulting
+    fluid domain wraps the body without including any cells inside it.
+
+    Two input paths:
+
+    * ``brep_bytes`` (preferred): native OCC BREP exported by TiGL via
+      ``exportWingBREPByUID`` / ``exportFusedBREP``. Watertight parametric
+      CAD imports directly with no sewing — robust for swept wings with
+      multiple sections.
+
+    * ``stl_bytes`` (fallback): tessellated surface. ``BRepBuilderAPI_Sewing``
+      stitches it into a shell. Works for simple closed bodies but can
+      leak at segment seams on complex aircraft geometry. Kept so unit
+      tests and synthetic inputs continue to function.
+
+    ``tests/test_volume_mesh_cfd_correctness.py`` pins down the topology
+    contract: no fluid cell may lie inside the input solid.
     """
     if not HAS_GMSH:
         raise_mcp_error("DependencyError", "gmsh is not installed or not available")
@@ -224,13 +311,46 @@ def _generate_volume_mesh_gmsh(
     with tempfile.NamedTemporaryFile(suffix=output_suffix, delete=False) as out_file:
         output_path = out_file.name
 
-    brep_path = _stl_bytes_to_solid_brep(stl_bytes)
-    stats: dict[str, Any] = {}
+    # Materialize the BREP we'll feed into gmsh's OCC importer. Prefer the
+    # native CAD path if available; otherwise build one by sewing the STL.
+    if brep_bytes is not None:
+        with tempfile.NamedTemporaryFile(
+            suffix=".brep", delete=False, mode="wb"
+        ) as brep_file:
+            brep_file.write(brep_bytes)
+            brep_path = brep_file.name
+        used_brep_source = "tigl"
+    else:
+        brep_path = _stl_bytes_to_solid_brep(stl_bytes)
+        used_brep_source = "stl_sewn"
+
+    stats: dict[str, Any] = {"brep_source": used_brep_source}
 
     try:
-        # Domain extent from the input STL bounding box. The far-field box
-        # is built around the geometry centroid.
-        min_x, max_x, min_y, max_y, min_z, max_z = _get_stl_bounding_box(stl_path)
+        gmsh.initialize()
+        gmsh.option.setNumber("General.Terminal", 0)
+        gmsh.model.add("volume_mesh")
+
+        # Aircraft solid (OCC) ─────────────────────────────────────────────
+        imported = gmsh.model.occ.importShapes(brep_path)
+        gmsh.model.occ.synchronize()
+        ac_volumes = [t for d, t in imported if d == 3]
+        if not ac_volumes:
+            raise_mcp_error(
+                "MeshError",
+                "Input geometry did not produce a closed OCC solid; cannot "
+                "build CFD mesh.",
+            )
+
+        # Sizing of the far-field box derives from the OCC solid's bbox
+        # rather than re-parsing the STL — works equally for both paths.
+        min_x, min_y, min_z, max_x, max_y, max_z = (
+            gmsh.model.occ.getBoundingBox(3, ac_volumes[0])
+        )
+        for tag in ac_volumes[1:]:
+            bb = gmsh.model.occ.getBoundingBox(3, tag)
+            min_x = min(min_x, bb[0]); min_y = min(min_y, bb[1]); min_z = min(min_z, bb[2])
+            max_x = max(max_x, bb[3]); max_y = max(max_y, bb[4]); max_z = max(max_z, bb[5])
         char_length = max(max_x - min_x, max_y - min_y, max_z - min_z)
         cx = (min_x + max_x) / 2
         cy = (min_y + max_y) / 2
@@ -244,32 +364,11 @@ def _generate_volume_mesh_gmsh(
             "z": [cz - ff, cz + ff],
         }
 
-        gmsh.initialize()
-        gmsh.option.setNumber("General.Terminal", 0)
-        gmsh.model.add("volume_mesh")
-
         # Far-field box (OCC) ─────────────────────────────────────────────
         box_tag = gmsh.model.occ.addBox(
             cx - ff, cy - ff, cz - ff, 2 * ff, 2 * ff, 2 * ff
         )
         gmsh.model.occ.synchronize()
-        box_surface_tags = [
-            t
-            for d, t in gmsh.model.getBoundary(
-                [(3, box_tag)], oriented=False, recursive=False
-            )
-            if d == 2
-        ]
-
-        # Aircraft solid (OCC, from sewn STL → BREP) ─────────────────────
-        imported = gmsh.model.occ.importShapes(brep_path)
-        gmsh.model.occ.synchronize()
-        ac_volumes = [t for d, t in imported if d == 3]
-        if not ac_volumes:
-            raise_mcp_error(
-                "MeshError",
-                "STL did not produce a closed OCC solid; cannot build CFD mesh.",
-            )
 
         # Subtract the body from the box so the fluid domain wraps it
         cut_result, _ = gmsh.model.occ.cut(
@@ -279,32 +378,20 @@ def _generate_volume_mesh_gmsh(
 
         fluid_volume_tags = [t for d, t in cut_result if d == 3]
 
-        # Classify resulting surfaces by centroid: those on the box edge
-        # are far-field, everything else is the body wall.
+        # Classify resulting surfaces by centroid: those on the box's outer
+        # planes are far-field, everything else is the body wall.
         farfield_tags: list[int] = []
         aircraft_tags: list[int] = []
-        edge_tol = 1e-6 * max(2 * ff, 1.0)
+        box_center = (cx, cy, cz)
+        edge_tol = 0.01 * char_length
         for _, surface_tag in gmsh.model.getEntities(2):
             com = gmsh.model.occ.getCenterOfMass(2, surface_tag)
-            on_box = (
-                abs(com[0] - (cx - ff)) < edge_tol
-                or abs(com[0] - (cx + ff)) < edge_tol
-                or abs(com[1] - (cy - ff)) < edge_tol
-                or abs(com[1] - (cy + ff)) < edge_tol
-                or abs(com[2] - (cz - ff)) < edge_tol
-                or abs(com[2] - (cz + ff)) < edge_tol
+            on_box = any(
+                abs(com[axis] - (box_center[axis] + sign * ff)) < edge_tol
+                for axis in range(3)
+                for sign in (-1, +1)
             )
             (farfield_tags if on_box else aircraft_tags).append(surface_tag)
-
-        # Fallback: if centroid heuristic failed (e.g. all surfaces ended up
-        # on one side), use the original box face tags as farfield.
-        if not aircraft_tags:
-            farfield_tags = [t for t in box_surface_tags if t in farfield_tags]
-            aircraft_tags = [
-                t
-                for _, t in gmsh.model.getEntities(2)
-                if t not in farfield_tags
-            ]
 
         if farfield_tags:
             fg = gmsh.model.addPhysicalGroup(2, farfield_tags)
@@ -319,17 +406,18 @@ def _generate_volume_mesh_gmsh(
         stats["farfield_surfaces"] = len(farfield_tags)
         stats["aircraft_surfaces"] = len(aircraft_tags)
 
-        # Mesh size options
+        # Mesh sizing — curvature-aware on the body so the LE/TE radii get
+        # enough elements; bounded by the user's mesh_size_min/max.
         gmsh.option.setNumber("Mesh.MeshSizeMin", params.mesh_size_min)
         gmsh.option.setNumber("Mesh.MeshSizeMax", params.mesh_size_max)
         gmsh.option.setNumber("Mesh.MeshSizeFromPoints", 0)
-        gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", 0)
-        gmsh.option.setNumber("Mesh.MeshSizeExtendFromBoundary", 0)
-        gmsh.option.setNumber("Mesh.Algorithm3D", 1)  # Delaunay
+        gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", 20)
+        gmsh.option.setNumber("Mesh.MeshSizeExtendFromBoundary", 1)
+        gmsh.option.setNumber("Mesh.Algorithm", 6)      # Frontal-Delaunay 2D
+        gmsh.option.setNumber("Mesh.Algorithm3D", 1)    # Delaunay 3D
 
         gmsh.model.mesh.generate(3)
 
-        # Statistics
         node_tags, _, _ = gmsh.model.mesh.getNodes()
         stats["node_count"] = len(node_tags)
         _, elem_tags, _ = gmsh.model.mesh.getElements(3)
@@ -392,23 +480,29 @@ def generate_volume_mesh_tool(session_manager: SessionManager) -> ToolDefinition
                     "Volume mesh requires real TiGL bindings (not stub mode).",
                 )
 
-            # Export STL surface
+            # Prefer TiGL's native BREP (parametric CAD, watertight) and
+            # fall back to STL (tessellation) only when BREP is unavailable.
+            brep_bytes: bytes | None = None
             if params.component_uid is not None:
                 component = config.find_component(params.component_uid)
                 if component is None:
                     raise_mcp_error(
                         "NotFound", f"Component '{params.component_uid}' not found"
                     )
+                brep_bytes = _export_brep_for_component(tigl_handle, component)
                 stl_bytes = _export_stl_for_component(tigl_handle, component)
             else:
+                brep_bytes = _export_configuration_brep(tigl_handle)
                 stl_bytes = _export_configuration_stl(tigl_handle)
 
             if not stl_bytes or len(stl_bytes) < 100:
                 raise_mcp_error(
-                    "ExportError", "Failed to export STL - empty or too small"
+                    "ExportError", "Failed to export geometry - empty or too small"
                 )
 
-            mesh_bytes, stats = _generate_volume_mesh_gmsh(stl_bytes, params)
+            mesh_bytes, stats = _generate_volume_mesh_gmsh(
+                stl_bytes, params, brep_bytes=brep_bytes
+            )
 
             if params.output_format == "su2" and b"NDIME=" not in mesh_bytes:
                 raise_mcp_error(

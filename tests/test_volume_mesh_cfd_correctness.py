@@ -197,7 +197,7 @@ def test_volume_mesh_carries_expected_markers() -> None:
         mesh_size_max=0.8,
         output_format="su2",
     )
-    mesh_bytes, _ = _generate_volume_mesh_gmsh(stl_bytes, params)
+    mesh_bytes, stats = _generate_volume_mesh_gmsh(stl_bytes, params)
 
     parsed = _parse_su2_mesh(mesh_bytes)
     markers = parsed["markers"]
@@ -206,3 +206,68 @@ def test_volume_mesh_carries_expected_markers() -> None:
     assert "farfield" in markers, f"Missing 'farfield' marker: {sorted(markers)}"
     assert len(markers["aircraft"]) > 0, "aircraft marker has no nodes"
     assert len(markers["farfield"]) > 0, "farfield marker has no nodes"
+
+    # Box has 6 outer faces. The classifier must put all of them in
+    # ``farfield`` — a regression in Phase G.1 silently misclassified
+    # box faces as ``aircraft`` because the per-axis centre coordinate
+    # was wrong, which propagated into the SU2 force computation.
+    assert stats["farfield_surfaces"] == 6, (
+        f"Expected 6 farfield surfaces (the box faces), got "
+        f"{stats['farfield_surfaces']}. Phase G.2 classifier regression."
+    )
+
+
+def test_volume_mesh_via_brep_path_is_watertight() -> None:
+    """Phase G.2: the BREP path must produce a leak-free mesh.
+
+    The Phase G.1 STL-sewing path leaked on swept multi-segment wings.
+    The fix routes TiGL's native BREP through gmsh.occ.importShapes,
+    skipping the sewer entirely. Smoke-test that contract here with a
+    synthetic OCC sphere BREP.
+    """
+    try:
+        from OCC.Core.BRepPrimAPI import (  # type: ignore[import-not-found]
+            BRepPrimAPI_MakeSphere,
+        )
+        from OCC.Core.BRepTools import breptools  # type: ignore[import-not-found]
+    except ImportError:
+        pytest.skip("pythonocc-core not available")
+
+    import tempfile
+
+    radius = 1.0
+    sphere = BRepPrimAPI_MakeSphere(radius).Shape()
+    with tempfile.NamedTemporaryFile(suffix=".brep", delete=False) as f:
+        brep_path = f.name
+    breptools.Write(sphere, brep_path)
+    with open(brep_path, "rb") as fh:
+        brep_bytes = fh.read()
+
+    params = GenerateVolumeMeshParams(
+        session_id="t",
+        far_field_distance=4.0,
+        mesh_size_min=0.05,
+        mesh_size_max=0.8,
+        output_format="su2",
+    )
+    # The function signature requires stl_bytes; pass a small valid one
+    # purely to satisfy the path even though brep_bytes drives meshing.
+    stl_bytes = _icosphere_stl(radius=1.0, subdiv=1)
+    mesh_bytes, stats = _generate_volume_mesh_gmsh(
+        stl_bytes, params, brep_bytes=brep_bytes
+    )
+
+    assert stats["brep_source"] == "tigl", (
+        "BREP-bytes path should have set brep_source=tigl in stats"
+    )
+
+    parsed = _parse_su2_mesh(mesh_bytes)
+    r = np.linalg.norm(parsed["points"], axis=1)
+    interior = int(np.sum(r < 0.95 * radius))
+    assert interior == 0, (
+        f"BREP path leak: {interior} fluid nodes inside unit sphere "
+        f"(min r={r.min():.3f})"
+    )
+    assert stats["farfield_surfaces"] == 6, (
+        f"BREP path: expected 6 box faces, got {stats['farfield_surfaces']}"
+    )
