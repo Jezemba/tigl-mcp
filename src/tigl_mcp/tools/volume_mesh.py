@@ -143,11 +143,74 @@ def _get_stl_bounding_box(
     return min_x, max_x, min_y, max_y, min_z, max_z
 
 
+def _stl_bytes_to_solid_brep(stl_bytes: bytes) -> str:
+    """Convert STL bytes into a watertight OCC solid written to a temp BREP file.
+
+    The previous implementation embedded the STL surfaces as a 2D shell inside
+    the fluid box (gmsh ``mesh.embed``), leaving fluid on both sides of the
+    surface and producing physically impossible CFD results (negative drag).
+    Sewing the triangulation into a closed shell and promoting it to a
+    ``TopoDS_Solid`` gives us a real OCC volume that can be subtracted from
+    the fluid domain via boolean cut.
+    """
+    try:
+        from OCC.Core.BRepBuilderAPI import (  # type: ignore[import-not-found]
+            BRepBuilderAPI_MakeSolid,
+            BRepBuilderAPI_Sewing,
+        )
+        from OCC.Core.BRepTools import breptools  # type: ignore[import-not-found]
+        from OCC.Core.TopAbs import TopAbs_SHELL  # type: ignore[import-not-found]
+        from OCC.Core.TopoDS import topods  # type: ignore[import-not-found]
+        from OCC.Extend.DataExchange import (  # type: ignore[import-not-found]
+            read_stl_file,
+        )
+    except ImportError as exc:
+        raise_mcp_error(
+            "DependencyError",
+            f"pythonocc-core is required to build CFD-correct volume meshes: {exc}",
+        )
+
+    with tempfile.NamedTemporaryFile(
+        suffix=".stl", delete=False, mode="wb"
+    ) as stl_file:
+        stl_file.write(stl_bytes)
+        stl_path = stl_file.name
+
+    try:
+        triangulation = read_stl_file(stl_path)
+
+        sewer = BRepBuilderAPI_Sewing(0.01)
+        sewer.Add(triangulation)
+        sewer.Perform()
+        sewn = sewer.SewedShape()
+
+        if sewn.ShapeType() == TopAbs_SHELL:
+            solid = BRepBuilderAPI_MakeSolid(topods.Shell(sewn)).Solid()
+        else:
+            solid = sewn
+
+        with tempfile.NamedTemporaryFile(suffix=".brep", delete=False) as brep_file:
+            brep_path = brep_file.name
+        breptools.Write(solid, brep_path)
+        return brep_path
+    finally:
+        try:
+            os.unlink(stl_path)
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def _generate_volume_mesh_gmsh(
     stl_bytes: bytes,
     params: GenerateVolumeMeshParams,
 ) -> tuple[bytes, dict[str, Any]]:
-    """Generate a volume mesh using gmsh with the STL embedded in a far-field box."""
+    """Generate a CFD-ready volume mesh around the STL geometry.
+
+    The aircraft is converted into a watertight OCC solid and subtracted from
+    the far-field box (boolean cut) so the resulting fluid domain wraps the
+    body without including any cells inside it. This is the property
+    ``tests/test_volume_mesh_cfd_correctness.py`` pins down.
+    """
     if not HAS_GMSH:
         raise_mcp_error("DependencyError", "gmsh is not installed or not available")
 
@@ -161,14 +224,12 @@ def _generate_volume_mesh_gmsh(
     with tempfile.NamedTemporaryFile(suffix=output_suffix, delete=False) as out_file:
         output_path = out_file.name
 
+    brep_path = _stl_bytes_to_solid_brep(stl_bytes)
     stats: dict[str, Any] = {}
 
     try:
-        gmsh.initialize()
-        gmsh.option.setNumber("General.Terminal", 0)
-        gmsh.model.add("volume_mesh")
-
-        # Determine domain size from the STL bounding box
+        # Domain extent from the input STL bounding box. The far-field box
+        # is built around the geometry centroid.
         min_x, max_x, min_y, max_y, min_z, max_z = _get_stl_bounding_box(stl_path)
         char_length = max(max_x - min_x, max_y - min_y, max_z - min_z)
         cx = (min_x + max_x) / 2
@@ -183,42 +244,80 @@ def _generate_volume_mesh_gmsh(
             "z": [cz - ff, cz + ff],
         }
 
-        # Create far-field box (OCC kernel)
+        gmsh.initialize()
+        gmsh.option.setNumber("General.Terminal", 0)
+        gmsh.model.add("volume_mesh")
+
+        # Far-field box (OCC) ─────────────────────────────────────────────
         box_tag = gmsh.model.occ.addBox(
             cx - ff, cy - ff, cz - ff, 2 * ff, 2 * ff, 2 * ff
         )
         gmsh.model.occ.synchronize()
+        box_surface_tags = [
+            t
+            for d, t in gmsh.model.getBoundary(
+                [(3, box_tag)], oriented=False, recursive=False
+            )
+            if d == 2
+        ]
 
-        # Import the aircraft STL
-        gmsh.merge(stl_path)
+        # Aircraft solid (OCC, from sewn STL → BREP) ─────────────────────
+        imported = gmsh.model.occ.importShapes(brep_path)
+        gmsh.model.occ.synchronize()
+        ac_volumes = [t for d, t in imported if d == 3]
+        if not ac_volumes:
+            raise_mcp_error(
+                "MeshError",
+                "STL did not produce a closed OCC solid; cannot build CFD mesh.",
+            )
 
-        # Separate box surfaces (tags 1-6) from aircraft surfaces
-        all_surfaces = gmsh.model.getEntities(2)
-        box_surface_tags = [1, 2, 3, 4, 5, 6]
-        ac_tags = [tag for _, tag in all_surfaces if tag not in box_surface_tags]
+        # Subtract the body from the box so the fluid domain wraps it
+        cut_result, _ = gmsh.model.occ.cut(
+            [(3, box_tag)], [(3, t) for t in ac_volumes]
+        )
+        gmsh.model.occ.synchronize()
 
-        # Classify discrete STL mesh into surfaces if needed
-        if not ac_tags:
-            try:
-                angle_rad = 40 * 3.14159 / 180
-                gmsh.model.mesh.classifySurfaces(
-                    angle_rad, True, True, 180 * 3.14159 / 180
-                )
-                gmsh.model.mesh.createGeometry()
-                all_surfaces = gmsh.model.getEntities(2)
-                ac_tags = [
-                    tag for _, tag in all_surfaces if tag not in box_surface_tags
-                ]
-            except Exception:  # noqa: BLE001
-                pass
+        fluid_volume_tags = [t for d, t in cut_result if d == 3]
 
-        # Reverse normals on aircraft surfaces so they point inward
-        if ac_tags:
-            gmsh.model.mesh.reverse([(2, t) for t in ac_tags])
+        # Classify resulting surfaces by centroid: those on the box edge
+        # are far-field, everything else is the body wall.
+        farfield_tags: list[int] = []
+        aircraft_tags: list[int] = []
+        edge_tol = 1e-6 * max(2 * ff, 1.0)
+        for _, surface_tag in gmsh.model.getEntities(2):
+            com = gmsh.model.occ.getCenterOfMass(2, surface_tag)
+            on_box = (
+                abs(com[0] - (cx - ff)) < edge_tol
+                or abs(com[0] - (cx + ff)) < edge_tol
+                or abs(com[1] - (cy - ff)) < edge_tol
+                or abs(com[1] - (cy + ff)) < edge_tol
+                or abs(com[2] - (cz - ff)) < edge_tol
+                or abs(com[2] - (cz + ff)) < edge_tol
+            )
+            (farfield_tags if on_box else aircraft_tags).append(surface_tag)
 
-        # Embed aircraft surfaces into the box volume
-        if ac_tags:
-            gmsh.model.mesh.embed(2, ac_tags, 3, box_tag)
+        # Fallback: if centroid heuristic failed (e.g. all surfaces ended up
+        # on one side), use the original box face tags as farfield.
+        if not aircraft_tags:
+            farfield_tags = [t for t in box_surface_tags if t in farfield_tags]
+            aircraft_tags = [
+                t
+                for _, t in gmsh.model.getEntities(2)
+                if t not in farfield_tags
+            ]
+
+        if farfield_tags:
+            fg = gmsh.model.addPhysicalGroup(2, farfield_tags)
+            gmsh.model.setPhysicalName(2, fg, "farfield")
+        if aircraft_tags:
+            ag = gmsh.model.addPhysicalGroup(2, aircraft_tags)
+            gmsh.model.setPhysicalName(2, ag, "aircraft")
+        if fluid_volume_tags:
+            vg = gmsh.model.addPhysicalGroup(3, fluid_volume_tags)
+            gmsh.model.setPhysicalName(3, vg, "fluid")
+
+        stats["farfield_surfaces"] = len(farfield_tags)
+        stats["aircraft_surfaces"] = len(aircraft_tags)
 
         # Mesh size options
         gmsh.option.setNumber("Mesh.MeshSizeMin", params.mesh_size_min)
@@ -228,36 +327,16 @@ def _generate_volume_mesh_gmsh(
         gmsh.option.setNumber("Mesh.MeshSizeExtendFromBoundary", 0)
         gmsh.option.setNumber("Mesh.Algorithm3D", 1)  # Delaunay
 
-        # Generate 3D mesh
         gmsh.model.mesh.generate(3)
-
-        # Physical groups: farfield, aircraft, fluid volume
-        existing = [s[1] for s in gmsh.model.getEntities(2)]
-        valid_box = [t for t in box_surface_tags if t in existing]
-        if valid_box:
-            fg = gmsh.model.addPhysicalGroup(2, valid_box)
-            gmsh.model.setPhysicalName(2, fg, "farfield")
-        stats["farfield_surfaces"] = len(valid_box)
-
-        valid_ac = [t for t in ac_tags if t in existing]
-        if valid_ac:
-            ag = gmsh.model.addPhysicalGroup(2, valid_ac)
-            gmsh.model.setPhysicalName(2, ag, "aircraft")
-        stats["aircraft_surfaces"] = len(valid_ac)
-
-        all_volumes = gmsh.model.getEntities(3)
-        if all_volumes:
-            vol_tags = [v[1] for v in all_volumes]
-            vg = gmsh.model.addPhysicalGroup(3, vol_tags)
-            gmsh.model.setPhysicalName(3, vg, "fluid")
 
         # Statistics
         node_tags, _, _ = gmsh.model.mesh.getNodes()
         stats["node_count"] = len(node_tags)
-        elem_types, elem_tags, _ = gmsh.model.mesh.getElements(3)
+        _, elem_tags, _ = gmsh.model.mesh.getElements(3)
         stats["element_count"] = sum(len(tags) for tags in elem_tags)
 
-        # Write output
+        # Write SU2 (or MSH) — only entities with physical tags are exported.
+        gmsh.option.setNumber("Mesh.SaveAll", 0)
         if params.output_format == "su2":
             gmsh.option.setNumber("Mesh.Format", 42)
         else:
@@ -278,7 +357,7 @@ def _generate_volume_mesh_gmsh(
             gmsh.finalize()
         except Exception:  # noqa: BLE001
             pass
-        for p in (stl_path, output_path):
+        for p in (stl_path, output_path, brep_path):
             try:
                 os.unlink(p)
             except Exception:  # noqa: BLE001
