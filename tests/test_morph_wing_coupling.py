@@ -130,6 +130,38 @@ def test_morph_fuselage_closes_geometry_loop() -> None:
     assert max(after["width"], after["height"]) > max(before["width"], before["height"])
 
 
+def test_set_high_level_parameters_morphs_geometry() -> None:
+    """The key coupling fix: set_high_level_parameters (the tool the agents
+    already call) now deforms the wing, so no agent/prompt change is needed."""
+    from tigl_mcp.tools.parameters import set_high_level_parameters_tool
+
+    if not CPACS.exists():
+        pytest.skip("D150 CPACS fixture not available")
+    sm = SessionManager()
+    session_id = open_cpacs_tool(sm).handler(
+        {"source_type": "path", "source": str(CPACS)}
+    )["session_id"]
+    if sm.get(session_id)[1]._tigl_handle is None:
+        pytest.skip("native TiGL runtime not available")
+
+    summary = get_wing_summary_tool(sm)
+    before = summary.handler({"session_id": session_id, "wing_uid": WING})
+
+    result = set_high_level_parameters_tool(sm).handler(
+        {
+            "session_id": session_id,
+            "component_uid": WING,
+            "updates": {"span": 45.0, "root_chord": 7.0, "tip_chord": 1.9, "sweep": 25.0},
+        }
+    )
+    gm = result.get("geometry_morph")
+    assert gm is not None and gm["rebuilt"] is True
+
+    after = summary.handler({"session_id": session_id, "wing_uid": WING})
+    # Geometry actually changed — the old behavior left this identical.
+    assert abs(after["span"] - before["span"]) > 1.0
+
+
 def test_morph_wing_requires_a_target() -> None:
     """No targets → a clear MorphError, not a silent no-op."""
     from tigl_mcp.errors import MCPError

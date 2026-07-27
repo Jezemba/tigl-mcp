@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+### Changed
+- `generate_volume_mesh` now auto-scales mesh sizing RELATIVE to the geometry's
+  characteristic length when `mesh_size_min`/`mesh_size_max` are left unset
+  (now the default). This keeps cell count ~constant (~0.6-0.7M) whether a wing
+  is morphed larger or smaller, instead of a fixed absolute size that ballooned
+  to millions of cells (and timed out SU2) on an enlarged wing. Explicit sizes
+  still override. Far-field distance was already a multiple of characteristic
+  length. `surface_mesh_size` is accepted for compatibility but unused.
+- `set_high_level_parameters` now actually DEFORMS wing/fuselage geometry (when a
+  real TiGL runtime is present) instead of only recording intent in a dict. It
+  translates the recorded parameters into a morph + rebuild (wing: area/AR from
+  span + root/tip chord, plus sweep; fuselage: length + diameter) via the shared
+  morph functions, and returns the measured new geometry under `geometry_morph`.
+  This closes the aero↔geometry loop with NO change to the agents/prompts — they
+  already call this tool. Falls back to record-only in stub mode.
+
 ### Added
 - New `morph_wing` tool — closes the aero↔geometry coupling. Unlike
   `set_high_level_parameters` (which only records intent in an in-memory dict and

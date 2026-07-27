@@ -36,10 +36,14 @@ class GenerateVolumeMeshParams(ToolParameters):
 
     session_id: str
     component_uid: str | None = None  # None means entire configuration
-    far_field_distance: float = 10.0
-    mesh_size_min: float = 0.1
-    mesh_size_max: float = 5.0
-    surface_mesh_size: float = 0.5
+    far_field_distance: float = 10.0  # multiple of characteristic length
+    # Absolute mesh sizes in metres. Leave as None (recommended) to auto-scale
+    # them RELATIVE to the geometry's characteristic length, so a morphed
+    # (larger/smaller) wing keeps roughly constant cell count and resolution.
+    # Explicit values override the relative sizing.
+    mesh_size_min: float | None = None
+    mesh_size_max: float | None = None
+    surface_mesh_size: float | None = None  # accepted for compatibility; unused
     boundary_layer_enabled: bool = False
     boundary_layer_thickness: float = 0.01
     boundary_layer_layers: int = 5
@@ -407,9 +411,27 @@ def _generate_volume_mesh_gmsh(
         stats["aircraft_surfaces"] = len(aircraft_tags)
 
         # Mesh sizing — curvature-aware on the body so the LE/TE radii get
-        # enough elements; bounded by the user's mesh_size_min/max.
-        gmsh.option.setNumber("Mesh.MeshSizeMin", params.mesh_size_min)
-        gmsh.option.setNumber("Mesh.MeshSizeMax", params.mesh_size_max)
+        # enough elements; bounded by min/max. When the caller doesn't pin
+        # absolute sizes, derive them RELATIVE to the meshed geometry's
+        # characteristic length (the BREP bbox's largest extent) so any morph
+        # keeps ~constant cell count. Fractions are calibrated to the D150
+        # baseline wing (char_length ~17 m for the mirrored half → min 0.3,
+        # max 8.0), which produces the known-good ~350k-cell mesh.
+        size_min = (
+            params.mesh_size_min
+            if params.mesh_size_min is not None
+            else round(char_length * 0.0176, 4)
+        )
+        size_max = (
+            params.mesh_size_max
+            if params.mesh_size_max is not None
+            else round(char_length * 0.47, 3)
+        )
+        stats["mesh_size_min"] = size_min
+        stats["mesh_size_max"] = size_max
+        stats["mesh_sizing"] = "absolute" if params.mesh_size_min is not None else "relative"
+        gmsh.option.setNumber("Mesh.MeshSizeMin", size_min)
+        gmsh.option.setNumber("Mesh.MeshSizeMax", size_max)
         gmsh.option.setNumber("Mesh.MeshSizeFromPoints", 0)
         gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", 20)
         gmsh.option.setNumber("Mesh.MeshSizeExtendFromBoundary", 1)
