@@ -16,7 +16,11 @@
   bust it) and swap it into the session. Returns the MEASURED geometry read back
   from the fresh handle. Regression test: `tests/test_morph_wing_coupling.py`
   (asserts `get_wing_summary` reports the new span/area/AR, the achieved values
-  match the targets, and the exported BREP bytes change).
+  match the targets, and the exported BREP bytes change). `target_area_m2` /
+  `target_aspect_ratio` use the FULL-planform convention (the tool doubles the
+  reference area for mirror-symmetric wings), so aviary's AREA / ASPECT_RATIO
+  design variables can be passed directly — e.g. area 130.1 / AR 15.6 yields
+  span 45 m, matching the F25 nominal.
 - New `morph_fuselage` tool — same idea for the fuselage: scales length (x) and
   diameter (y,z) via the fuselage transformation, rebuilds, and reports the new
   dimensions. Current/measured dimensions come from the exported BREP's

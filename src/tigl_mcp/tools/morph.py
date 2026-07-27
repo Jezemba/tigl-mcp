@@ -66,11 +66,20 @@ def _call_first(obj: Any, names: list[str], *args: Any) -> Any:
     raise AttributeError(f"none of {names} found on {type(obj).__name__}")
 
 
-def _measure(tigl: Any, wing_uid: str, wing_index: int) -> dict[str, float | None]:
-    """Read span / reference area / AR / sweep / MAC from a TiGL handle, using
-    the same conventions as get_wing_summary (wingGetReferenceArea sym plane 0)."""
+def _measure(
+    tigl: Any, wing_uid: str, wing_index: int, sym_factor: float = 1.0
+) -> dict[str, float | None]:
+    """Read span / reference area / AR / sweep / MAC from a TiGL handle.
+
+    ``sym_factor`` accounts for mirror-symmetric wings: CPACS models one half
+    (e.g. ``symmetry="x-z-plane"``), so ``wingGetReferenceArea`` returns the
+    half-wing area. Multiplying by 2 gives the FULL planform area, which is the
+    convention aviary's AREA / ASPECT_RATIO design variables use — so the agent
+    can pass aviary's numbers directly. ``wingGetSpan`` already returns the full
+    (tip-to-tip) span, so AR = full_span**2 / full_area is the true aspect ratio.
+    """
     span: float = tigl.wingGetSpan(wing_uid)
-    reference_area: float = tigl.wingGetReferenceArea(wing_index, 0)
+    reference_area: float = tigl.wingGetReferenceArea(wing_index, 0) * sym_factor
     aspect_ratio = (span**2) / reference_area if reference_area else None
     try:
         mac_length = tigl.wingGetMAC(wing_uid)[0]
@@ -195,7 +204,12 @@ def morph_wing_tool(session_manager: SessionManager) -> ToolDefinition:
             cpacs_config = mgr.get_configuration(native._handle.value)
             wing = _call_first(cpacs_config, ["get_wing", "getWing"], params.wing_uid)
 
-            before = _measure(native, params.wing_uid, component.index)
+            # Mirror-symmetric wings model one half → double the reference area to
+            # the full planform so target_area_m2 / target_aspect_ratio match
+            # aviary's convention (agent passes aviary's AREA / AR directly).
+            sym_factor = 2.0 if component.symmetry else 1.0
+
+            before = _measure(native, params.wing_uid, component.index, sym_factor)
             cur_span = float(before["span"])
             cur_area = float(before["reference_area"])
             cur_ar = (cur_span**2) / cur_area if cur_area else 0.0
@@ -251,7 +265,7 @@ def morph_wing_tool(session_manager: SessionManager) -> ToolDefinition:
                 # and BREP export; only the cached reference_area read-back is
                 # stale. Report that rather than failing outright.
                 rebuilt = False
-                after = _measure(native, params.wing_uid, component.index)
+                after = _measure(native, params.wing_uid, component.index, sym_factor)
                 return {
                     "wing_uid": component.uid,
                     "requested": requested,
@@ -262,7 +276,7 @@ def morph_wing_tool(session_manager: SessionManager) -> ToolDefinition:
                     "reference_area read-back may be cached.",
                 }
 
-            after = _measure(native, params.wing_uid, component.index)
+            after = _measure(native, params.wing_uid, component.index, sym_factor)
 
             # Keep the Python-side parameter dict consistent with the geometry.
             component.parameters["span"] = after["span"]

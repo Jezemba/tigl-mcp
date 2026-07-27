@@ -62,11 +62,14 @@ def test_morph_wing_closes_geometry_loop() -> None:
     summary = get_wing_summary_tool(sm)
     morph = morph_wing_tool(sm)
 
-    before = summary.handler({"session_id": session_id, "wing_uid": WING})
+    ws_before = summary.handler({"session_id": session_id, "wing_uid": WING})
     brep_before = _brep_bytes(sm, session_id)
 
-    target_area = 95.0
-    target_ar = 12.0
+    # Aviary's F25 design variables, passed DIRECTLY (the tool is symmetry-aware,
+    # so target_area_m2 / target_aspect_ratio are the full-planform convention —
+    # no ratios or unit conversions needed).
+    target_area = 130.1
+    target_ar = 15.6
     result = morph.handler(
         {
             "session_id": session_id,
@@ -76,20 +79,23 @@ def test_morph_wing_closes_geometry_loop() -> None:
         }
     )
     assert result["rebuilt"] is True
+    before, after = result["before"], result["after"]
 
-    after = summary.handler({"session_id": session_id, "wing_uid": WING})
-    brep_after = _brep_bytes(sm, session_id)
+    # 1. Baseline reads as an A320-class wing (full planform), not the half-area
+    #    artifact — confirms the symmetry factor.
+    assert before["aspect_ratio"] == pytest.approx(9.4, rel=0.1)
 
-    # 1. get_wing_summary reflects the new geometry (not the stale cache).
-    assert abs(after["reference_area"] - before["reference_area"]) > 1.0
-    assert abs(after["aspect_ratio"] - before["aspect_ratio"]) > 0.5
-
-    # 2. Achieved area/AR match the requested targets within tolerance.
+    # 2. The morph hits aviary's targets directly.
     assert after["reference_area"] == pytest.approx(target_area, rel=0.05)
     assert after["aspect_ratio"] == pytest.approx(target_ar, rel=0.05)
 
-    # 3. The exported BREP (the mesher's input) actually changed → the mesh and
+    # 3. get_wing_summary reflects the new geometry (span moved; not a no-op).
+    ws_after = summary.handler({"session_id": session_id, "wing_uid": WING})
+    assert abs(ws_after["span"] - ws_before["span"]) > 1.0
+
+    # 4. The exported BREP (the mesher's input) actually changed → the mesh and
     #    therefore SU2's CL/CD will move off the fixed baseline.
+    brep_after = _brep_bytes(sm, session_id)
     assert hashlib.md5(brep_before).digest() != hashlib.md5(brep_after).digest()
 
 
