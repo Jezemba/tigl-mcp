@@ -18,6 +18,7 @@ from tigl_mcp.tools.metrics import (
     get_fuselage_summary_tool,
     get_wing_summary_tool,
 )
+from tigl_mcp.tools.morph import morph_fuselage_tool, morph_wing_tool
 from tigl_mcp.tools.parameters import (
     get_high_level_parameters_tool,
     set_high_level_parameters_tool,
@@ -49,5 +50,7 @@ def build_tools(session_manager: SessionManager) -> list[ToolDefinition]:
         export_configuration_cad_tool(session_manager),
         get_high_level_parameters_tool(session_manager),
         set_high_level_parameters_tool(session_manager),
+        morph_wing_tool(session_manager),
+        morph_fuselage_tool(session_manager),
         generate_volume_mesh_tool(session_manager),
     ]

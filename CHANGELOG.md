@@ -3,6 +3,26 @@
 ## [Unreleased]
 
 ### Added
+- New `morph_wing` tool — closes the aero↔geometry coupling. Unlike
+  `set_high_level_parameters` (which only records intent in an in-memory dict and
+  never touches geometry), `morph_wing` deforms the live TiGL wing to hit a
+  target reference area, aspect ratio, and/or sweep, then rebuilds so
+  `generate_volume_mesh` / `exportWingBREPByUID` and downstream SU2 CFD reflect
+  the new shape. Mechanism: fetch the live `CCPACSConfiguration` from the
+  session handle, scale the wing transformation (x=chord, y=span, z=thickness;
+  span ∝ y, reference_area ∝ x·y — verified exact on the D150) and set positioning
+  sweep, `WriteCPACS` back to TiXI, then reopen a fresh TiGL handle (required —
+  the C-API caches `wingGetReferenceArea` on a handle and `Invalidate` does not
+  bust it) and swap it into the session. Returns the MEASURED geometry read back
+  from the fresh handle. Regression test: `tests/test_morph_wing_coupling.py`
+  (asserts `get_wing_summary` reports the new span/area/AR, the achieved values
+  match the targets, and the exported BREP bytes change).
+- New `morph_fuselage` tool — same idea for the fuselage: scales length (x) and
+  diameter (y,z) via the fuselage transformation, rebuilds, and reports the new
+  dimensions. Current/measured dimensions come from the exported BREP's
+  OpenCASCADE bounding box, deliberately avoiding the native fuselage geometry
+  queries (`fuselageGetVolume`/`fuselageGetLength`), which segfault on some CPACS
+  files (e.g. the D150) and crash the server uncatchably.
 - Real TiGL/TiXI backend support: when `tigl3` and `tixi3` are installed the
   server now uses native API calls instead of stub/synthetic data.
 - `_tigl_handle` and `_tixi_handle` fields on `TiglConfiguration` and

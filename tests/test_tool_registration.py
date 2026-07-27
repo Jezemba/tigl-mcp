@@ -29,6 +29,8 @@ def test_build_tools_registers_expected_stub_toolset() -> None:
         "export_configuration_cad",
         "get_high_level_parameters",
         "set_high_level_parameters",
+        "morph_wing",
+        "morph_fuselage",
         "generate_volume_mesh",
     ]
 
