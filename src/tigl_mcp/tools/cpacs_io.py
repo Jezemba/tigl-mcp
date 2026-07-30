@@ -167,7 +167,11 @@ def export_cpacs_tool(session_manager: SessionManager) -> ToolDefinition:
             tixi_handle, _tigl_handle, _config = require_session(
                 session_manager, params.session_id
             )
-            out = pathlib.Path(params.output_path)
+            # Resolve to an ABSOLUTE path: each MCP server has its own working
+            # directory, so a relative output_path would land under the tigl
+            # server's cwd and be invisible to the mass discipline. Returning an
+            # absolute path makes the export unambiguous for every downstream reader.
+            out = pathlib.Path(params.output_path).expanduser().resolve()
             out.parent.mkdir(parents=True, exist_ok=True)
 
             native = getattr(tixi_handle, "_tixi_handle", None)
