@@ -11,6 +11,7 @@ from tigl_mcp.cpacs import build_handles, parse_cpacs
 from tigl_mcp.errors import MCPError, raise_mcp_error
 from tigl_mcp.session_manager import SessionManager
 from tigl_mcp.tooling import ToolDefinition, ToolParameters
+from tigl_mcp.tools.common import require_session
 
 
 class OpenCpacsParams(ToolParameters):
@@ -24,6 +25,13 @@ class CloseCpacsParams(ToolParameters):
     """Parameters for the close_cpacs tool."""
 
     session_id: str
+
+
+class ExportCpacsParams(ToolParameters):
+    """Parameters for the export_cpacs tool."""
+
+    session_id: str
+    output_path: str
 
 
 def _read_source(params: OpenCpacsParams) -> tuple[str, str | None]:
@@ -138,4 +146,69 @@ def close_cpacs_tool(session_manager: SessionManager) -> ToolDefinition:
         parameters_model=CloseCpacsParams,
         handler=handler,
         output_schema={"success": "boolean"},
+    )
+
+
+def export_cpacs_tool(session_manager: SessionManager) -> ToolDefinition:
+    """Create the export_cpacs tool definition.
+
+    Persists a session's CURRENT (possibly morphed) CPACS geometry to a file.
+    ``set_high_level_parameters`` / ``morph_wing`` / ``morph_fuselage`` write the
+    deformation back into the session's live TiXI document (WriteCPACS), so this
+    tool exports that document — letting downstream disciplines that read CPACS
+    from disk (e.g. mass-mcp ``estimate_mass``) see the MORPHED design rather than
+    the original baseline file. Without it, structural mass is computed on baseline
+    geometry regardless of the morph (geometry-decoupled).
+    """
+
+    def handler(raw_params: dict[str, object]) -> dict[str, object]:
+        try:
+            params = ExportCpacsParams.model_validate(raw_params)
+            tixi_handle, _tigl_handle, _config = require_session(
+                session_manager, params.session_id
+            )
+            out = pathlib.Path(params.output_path)
+            out.parent.mkdir(parents=True, exist_ok=True)
+
+            native = getattr(tixi_handle, "_tixi_handle", None)
+            if native is not None and hasattr(native, "exportDocumentAsString"):
+                # Most deterministic: serialize the live in-memory tree (includes
+                # every morph edit) and write it ourselves.
+                xml = native.exportDocumentAsString()
+                out.write_text(xml, encoding="utf-8")
+                source = "tixi-native (morphed geometry)"
+            elif native is not None and hasattr(native, "saveDocument"):
+                native.saveDocument(str(out))
+                source = "tixi-native saveDocument (morphed geometry)"
+            else:
+                # Stub / no native runtime — best effort: last known XML string.
+                out.write_text(
+                    getattr(tixi_handle, "xml_content", "") or "", encoding="utf-8"
+                )
+                source = "xml_content (stub — no native TiXI runtime)"
+
+            if not out.exists() or out.stat().st_size == 0:
+                raise_mcp_error(
+                    "ExportError",
+                    f"CPACS export produced no content at {out}",
+                )
+            return {
+                "status": "success",
+                "cpacs_file_path": str(out),
+                "source": source,
+            }
+        except MCPError as error:
+            raise error
+        except Exception as exc:  # pragma: no cover - defensive path
+            raise_mcp_error("ExportError", "Failed to export CPACS", str(exc))
+
+    return ToolDefinition(
+        name="export_cpacs",
+        description=(
+            "Save the current (morphed) CPACS geometry of a session to a file so "
+            "disk-reading disciplines (e.g. mass estimation) see the morphed design."
+        ),
+        parameters_model=ExportCpacsParams,
+        handler=handler,
+        output_schema={},
     )
