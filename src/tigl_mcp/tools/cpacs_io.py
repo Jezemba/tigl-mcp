@@ -130,11 +130,38 @@ def open_cpacs_tool(session_manager: SessionManager) -> ToolDefinition:
 def close_cpacs_tool(session_manager: SessionManager) -> ToolDefinition:
     """Create the close_cpacs tool definition."""
 
-    def handler(raw_params: dict[str, object]) -> dict[str, bool]:
+    def handler(raw_params: dict[str, object]) -> dict[str, object]:
         try:
             params = CloseCpacsParams.model_validate(raw_params)
+            # AUTO-EXPORT the (possibly morphed) geometry to an absolute path BEFORE
+            # closing, so disciplines that read CPACS from disk (mass-mcp) always see
+            # the current design — independent of whether the agent called export_cpacs
+            # or whether export_cpacs is in its toolset. This makes the structures
+            # coupling work uniformly across ALL coordination combinations. Best-effort:
+            # never let an export problem block the close.
+            auto_path: str | None = None
+            try:
+                tixi_handle, _tigl, _cfg = require_session(
+                    session_manager, params.session_id
+                )
+                native = getattr(tixi_handle, "_tixi_handle", None)
+                if native is not None and hasattr(native, "exportDocumentAsString"):
+                    out = pathlib.Path(
+                        f"/tmp/cpacs_autoexport_{params.session_id}.xml"
+                    )
+                    out.write_text(
+                        native.exportDocumentAsString(), encoding="utf-8"
+                    )
+                    if out.is_file() and out.stat().st_size > 0:
+                        auto_path = str(out)
+            except Exception:  # noqa: BLE001 - export is best-effort
+                auto_path = None
             session_manager.close(params.session_id)
-            return {"success": True}
+            resp: dict[str, object] = {"success": True}
+            if auto_path:
+                resp["cpacs_file_path"] = auto_path
+                resp["auto_exported"] = True
+            return resp
         except MCPError as error:
             raise error
         except Exception as exc:  # pragma: no cover - defensive path
@@ -142,10 +169,14 @@ def close_cpacs_tool(session_manager: SessionManager) -> ToolDefinition:
 
     return ToolDefinition(
         name="close_cpacs",
-        description="Close a CPACS session and free resources.",
+        description=(
+            "Close a CPACS session and free resources. Auto-exports the current "
+            "(possibly morphed) geometry to a file first so downstream mass sizing "
+            "reads the actual design."
+        ),
         parameters_model=CloseCpacsParams,
         handler=handler,
-        output_schema={"success": "boolean"},
+        output_schema={},
     )
 
 
