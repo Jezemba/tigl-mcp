@@ -135,7 +135,7 @@ def close_cpacs_tool(session_manager: SessionManager) -> ToolDefinition:
             params = CloseCpacsParams.model_validate(raw_params)
             # AUTO-EXPORT the (possibly morphed) geometry to an absolute path BEFORE
             # closing, so disciplines that read CPACS from disk (mass-mcp) always see
-            # the current design — independent of whether the agent called export_cpacs
+            # the current design -- independent of whether the agent called export_cpacs
             # or whether export_cpacs is in its toolset. This makes the structures
             # coupling work uniformly across ALL coordination combinations. Best-effort:
             # never let an export problem block the close.
@@ -205,7 +205,7 @@ def export_cpacs_tool(session_manager: SessionManager) -> ToolDefinition:
     Persists a session's CURRENT (possibly morphed) CPACS geometry to a file.
     ``set_high_level_parameters`` / ``morph_wing`` / ``morph_fuselage`` write the
     deformation back into the session's live TiXI document (WriteCPACS), so this
-    tool exports that document — letting downstream disciplines that read CPACS
+    tool exports that document -- letting downstream disciplines that read CPACS
     from disk (e.g. mass-mcp ``estimate_mass``) see the MORPHED design rather than
     the original baseline file. Without it, structural mass is computed on baseline
     geometry regardless of the morph (geometry-decoupled).
@@ -235,11 +235,11 @@ def export_cpacs_tool(session_manager: SessionManager) -> ToolDefinition:
                 native.saveDocument(str(out))
                 source = "tixi-native saveDocument (morphed geometry)"
             else:
-                # Stub / no native runtime — best effort: last known XML string.
+                # Stub / no native runtime -- best effort: last known XML string.
                 out.write_text(
                     getattr(tixi_handle, "xml_content", "") or "", encoding="utf-8"
                 )
-                source = "xml_content (stub — no native TiXI runtime)"
+                source = "xml_content (stub -- no native TiXI runtime)"
 
             if not out.exists() or out.stat().st_size == 0:
                 raise_mcp_error(
