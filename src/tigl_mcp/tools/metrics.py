@@ -10,7 +10,7 @@ from __future__ import annotations
 from typing import Any
 
 from tigl_mcp.cpacs import ComponentDefinition, CPACSConfiguration, TiglConfiguration
-from tigl_mcp.errors import MCPError, raise_mcp_error
+from tigl_mcp.errors import MCPError, raise_component_not_found, raise_mcp_error
 from tigl_mcp.session_manager import SessionManager
 from tigl_mcp.tooling import ToolDefinition, ToolParameters
 from tigl_mcp.tools.common import require_session
@@ -36,7 +36,7 @@ def _safe_get_component(
     """Resolve a component or raise an MCP error."""
     component = config.find_component(uid)
     if component is None:
-        raise_mcp_error("NotFound", f"{type_name} '{uid}' not found")
+        raise_component_not_found(config, uid, type_name)
     return component
 
 

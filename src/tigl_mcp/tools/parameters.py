@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from tigl_mcp.errors import MCPError, raise_mcp_error
+from tigl_mcp.errors import MCPError, raise_component_not_found, raise_mcp_error
 from tigl_mcp.session_manager import SessionManager
 from tigl_mcp.tooling import ToolDefinition, ToolParameters
 from tigl_mcp.tools.common import require_session
@@ -91,9 +91,7 @@ def get_high_level_parameters_tool(session_manager: SessionManager) -> ToolDefin
             _, _, config = require_session(session_manager, params.session_id)
             component = config.find_component(params.component_uid)
             if component is None:
-                raise_mcp_error(
-                    "NotFound", f"Component '{params.component_uid}' not found"
-                )
+                raise_component_not_found(config, params.component_uid)
             return {"component_uid": component.uid, "parameters": component.parameters}
         except MCPError as error:
             raise error
@@ -120,9 +118,7 @@ def set_high_level_parameters_tool(session_manager: SessionManager) -> ToolDefin
             )
             component = config.find_component(params.component_uid)
             if component is None:
-                raise_mcp_error(
-                    "NotFound", f"Component '{params.component_uid}' not found"
-                )
+                raise_component_not_found(config, params.component_uid)
             warnings: list[str] = []
             for key, value in params.updates.items():
                 current_value = component.parameters.get(key)

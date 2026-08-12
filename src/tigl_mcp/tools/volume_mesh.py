@@ -13,7 +13,7 @@ import tempfile
 from typing import Any, Literal
 
 from tigl_mcp.cpacs import ComponentDefinition, TiglConfiguration
-from tigl_mcp.errors import MCPError, raise_mcp_error
+from tigl_mcp.errors import MCPError, raise_component_not_found, raise_mcp_error
 from tigl_mcp.session_manager import SessionManager
 from tigl_mcp.tooling import ToolDefinition, ToolParameters
 from tigl_mcp.tools.common import require_session
@@ -508,9 +508,7 @@ def generate_volume_mesh_tool(session_manager: SessionManager) -> ToolDefinition
             if params.component_uid is not None:
                 component = config.find_component(params.component_uid)
                 if component is None:
-                    raise_mcp_error(
-                        "NotFound", f"Component '{params.component_uid}' not found"
-                    )
+                    raise_component_not_found(config, params.component_uid)
                 brep_bytes = _export_brep_for_component(tigl_handle, component)
                 stl_bytes = _export_stl_for_component(tigl_handle, component)
             else:

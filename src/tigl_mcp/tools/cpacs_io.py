@@ -140,6 +140,7 @@ def close_cpacs_tool(session_manager: SessionManager) -> ToolDefinition:
             # coupling work uniformly across ALL coordination combinations. Best-effort:
             # never let an export problem block the close.
             auto_path: str | None = None
+            export_error: str = ""
             try:
                 tixi_handle, _tigl, _cfg = require_session(
                     session_manager, params.session_id
@@ -154,13 +155,31 @@ def close_cpacs_tool(session_manager: SessionManager) -> ToolDefinition:
                     )
                     if out.is_file() and out.stat().st_size > 0:
                         auto_path = str(out)
-            except Exception:  # noqa: BLE001 - export is best-effort
+            except Exception as exc:  # noqa: BLE001 - export is best-effort
                 auto_path = None
+                export_error = str(exc)
             session_manager.close(params.session_id)
             resp: dict[str, object] = {"success": True}
             if auto_path:
                 resp["cpacs_file_path"] = auto_path
                 resp["auto_exported"] = True
+            else:
+                # The close genuinely succeeded, so `success` stays True -- but a
+                # silent auto-export failure is not harmless. This file is what
+                # downstream mass sizing reads to see the MORPHED geometry; with
+                # no file and no stated reason, the caller falls back to the
+                # original CPACS path and sizes the BASELINE aircraft while
+                # everything still reports success (the open B21 symptom).
+                resp["auto_exported"] = False
+                resp["auto_export_error"] = export_error or (
+                    "this session exposes no native TiXI handle, so the morphed "
+                    "geometry could not be written"
+                )
+                resp["warning"] = (
+                    "No morphed CPACS file was exported. Anything downstream that "
+                    "reads geometry will see the ORIGINAL file, not this session's "
+                    "changes."
+                )
             return resp
         except MCPError as error:
             raise error

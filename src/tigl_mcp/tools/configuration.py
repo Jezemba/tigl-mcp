@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from tigl_mcp.cpacs import ComponentDefinition
-from tigl_mcp.errors import MCPError, raise_mcp_error
+from tigl_mcp.errors import MCPError, raise_component_not_found, raise_mcp_error
 from tigl_mcp.session_manager import SessionManager
 from tigl_mcp.tooling import ToolDefinition, ToolParameters
 from tigl_mcp.tools.common import format_bounding_box, require_session
@@ -133,9 +133,7 @@ def get_component_metadata_tool(session_manager: SessionManager) -> ToolDefiniti
             _, _, config = require_session(session_manager, params.session_id)
             component = config.find_component(params.component_uid)
             if component is None:
-                raise_mcp_error(
-                    "NotFound", f"Component '{params.component_uid}' not found"
-                )
+                raise_component_not_found(config, params.component_uid)
             metadata: dict[str, object] = {
                 "uid": component.uid,
                 "type": component.type_name,

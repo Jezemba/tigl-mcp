@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Literal, NoReturn
 
 from tigl_mcp.cpacs import ComponentDefinition, TiglConfiguration
-from tigl_mcp.errors import MCPError, raise_mcp_error
+from tigl_mcp.errors import MCPError, raise_component_not_found, raise_mcp_error
 from tigl_mcp.session_manager import SessionManager
 from tigl_mcp.tooling import ToolDefinition, ToolParameters
 from tigl_mcp.tools.common import format_bounding_box, require_session
@@ -335,9 +335,7 @@ def export_component_mesh_tool(session_manager: SessionManager) -> ToolDefinitio
 
             component = config.find_component(params.component_uid)
             if component is None:
-                raise_mcp_error(
-                    "NotFound", f"Component '{params.component_uid}' not found"
-                )
+                raise_component_not_found(config, params.component_uid)
 
             _ensure_export_supported(
                 tigl_handle=tigl_handle,

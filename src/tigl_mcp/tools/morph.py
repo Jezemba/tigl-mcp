@@ -31,7 +31,7 @@ from importlib import import_module
 from typing import Any
 
 from tigl_mcp.cpacs import ComponentDefinition, TiglConfiguration, TixiDocument
-from tigl_mcp.errors import MCPError, raise_mcp_error
+from tigl_mcp.errors import MCPError, raise_component_not_found, raise_mcp_error
 from tigl_mcp.session_manager import SessionManager
 from tigl_mcp.tooling import ToolDefinition, ToolParameters
 from tigl_mcp.tools.common import require_session
@@ -322,7 +322,7 @@ def morph_wing_tool(session_manager: SessionManager) -> ToolDefinition:
             tixi_handle, tigl_handle, config = require_session(session_manager, params.session_id)
             component = config.find_component(params.wing_uid)
             if component is None:
-                raise_mcp_error("NotFound", f"Wing '{params.wing_uid}' not found")
+                raise_component_not_found(config, params.wing_uid, "Wing")
             if all(v is None for v in (params.target_area_m2, params.target_aspect_ratio, params.target_sweep_deg)):
                 raise_mcp_error(
                     "MorphError",
@@ -363,7 +363,7 @@ def morph_fuselage_tool(session_manager: SessionManager) -> ToolDefinition:
             tixi_handle, tigl_handle, config = require_session(session_manager, params.session_id)
             component = config.find_component(params.fuselage_uid)
             if component is None:
-                raise_mcp_error("NotFound", f"Fuselage '{params.fuselage_uid}' not found")
+                raise_component_not_found(config, params.fuselage_uid, "Fuselage")
             if params.target_length_m is None and params.target_diameter_m is None:
                 raise_mcp_error(
                     "MorphError", "Provide at least one of target_length_m, target_diameter_m."
