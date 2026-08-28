@@ -31,6 +31,13 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 
+# Floor for an agent-supplied absolute `mesh_size_min`, as a fraction of the
+# geometry's characteristic length. Half the calibrated default (0.0176), i.e.
+# twice as fine as the known-good ~350k-cell mesh. See the clamp in
+# _generate_volume_mesh_gmsh for the measurements behind this (B69).
+MESH_SIZE_MIN_FLOOR_FRACTION = 0.0088
+
+
 class GenerateVolumeMeshParams(ToolParameters):
     """Parameters for generate_volume_mesh tool."""
 
@@ -417,8 +424,45 @@ def _generate_volume_mesh_gmsh(
         # keeps ~constant cell count. Fractions are calibrated to the D150
         # baseline wing (char_length ~17 m for the mirrored half → min 0.3,
         # max 8.0), which produces the known-good ~350k-cell mesh.
+        # An absolute mesh_size_min is CLAMPED to a floor (B69).
+        #
+        # The relative default below is calibrated to ~350k cells. Cell count
+        # scales roughly with (1/h)^3, so a caller asking for a smaller h buys an
+        # explosion very quickly. Measured 2026-08-20 on the D150 fixture
+        # (char_length ~17 m, calibrated default 0.30):
+        #
+        #     mesh_size_min=0.5  -> 55 s, 114 MB mesh
+        #     mesh_size_min=0.1  -> still running at 21 MINUTES, RSS climbing
+        #                           linearly 2.2 -> 14.7 GB, killed manually
+        #
+        # That mattered far beyond one slow call: this handler is SYNCHRONOUS, so
+        # while it runs tigl-mcp answers nothing -- not other tools, not tool
+        # discovery, not new connections. It is indistinguishable from a dead
+        # server, and the outage outlived the run: it silently invalidated 6 of 16
+        # runs in the 2026-08-18 sweep, several of which were still recorded as
+        # `success` because the client fails soft on a missing server.
+        #
+        # The floor is half the calibrated default -- twice as fine as the
+        # known-good mesh (~8x the cells), which is expensive but bounded and
+        # still finishes. Clamping is REPORTED in stats rather than applied
+        # silently, so a caller can see its value was adjusted and why: an error
+        # that names the value it used gets one-step recovery here, whereas a
+        # silent override teaches the caller nothing.
+        _min_floor = round(char_length * MESH_SIZE_MIN_FLOOR_FRACTION, 4)
+        if params.mesh_size_min is not None and params.mesh_size_min < _min_floor:
+            stats["mesh_size_min_requested"] = params.mesh_size_min
+            stats["mesh_size_min_clamped_to"] = _min_floor
+            stats["mesh_size_min_clamp_reason"] = (
+                f"mesh_size_min={params.mesh_size_min} is finer than the floor "
+                f"{_min_floor} (= {MESH_SIZE_MIN_FLOOR_FRACTION} x characteristic "
+                f"length {char_length:.2f} m). Cell count scales ~(1/h)^3, and "
+                f"finer values have been measured to run for tens of minutes and "
+                f"exhaust memory without completing. Using the floor instead. "
+                f"Omit mesh_size_min entirely to get the calibrated default "
+                f"({round(char_length * 0.0176, 4)}), which is the recommended value."
+            )
         size_min = (
-            params.mesh_size_min
+            max(params.mesh_size_min, _min_floor)
             if params.mesh_size_min is not None
             else round(char_length * 0.0176, 4)
         )
