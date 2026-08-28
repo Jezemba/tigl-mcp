@@ -37,6 +37,12 @@ except ImportError:
 # _generate_volume_mesh_gmsh for the measurements behind this (B69).
 MESH_SIZE_MIN_FLOOR_FRACTION = 0.0088
 
+# Hard cap on the ESTIMATED cell count. The calibrated default produces ~350k
+# actual cells; this sits far above that so only genuine runaways are refused.
+# See the pre-flight check in _generate_volume_mesh_gmsh for why the cost must be
+# bounded before meshing rather than aborted during it (B69-A).
+MAX_ESTIMATED_CELLS = 3_000_000
+
 
 class GenerateVolumeMeshParams(ToolParameters):
     """Parameters for generate_volume_mesh tool."""
@@ -481,6 +487,59 @@ def _generate_volume_mesh_gmsh(
         gmsh.option.setNumber("Mesh.MeshSizeExtendFromBoundary", 1)
         gmsh.option.setNumber("Mesh.Algorithm", 6)      # Frontal-Delaunay 2D
         gmsh.option.setNumber("Mesh.Algorithm3D", 1)    # Delaunay 3D
+
+        # Refuse a mesh whose cost is unbounded BEFORE generating it (B69-A).
+        #
+        # gmsh.model.mesh.generate(3) cannot be interrupted once started, and this
+        # handler is synchronous, so an over-large mesh takes the whole server out
+        # of service. The cost must therefore be bounded up front, not aborted
+        # midway.
+        #
+        # Clamping mesh_size_min alone is NOT sufficient -- measured 2026-08-27,
+        # after that clamp shipped, an agent reached the same hang through the
+        # other two knobs:
+        #     mesh_size_min=0.1 (clamped to 0.1492), mesh_size_max=2.0,
+        #     far_field_distance=15.0
+        # A 3x larger domain meshed ~4x more finely at the boundary. tigl stopped
+        # answering for 15+ minutes and the sweep was lost. Cost depends on the
+        # DOMAIN and BOTH size bounds, so the estimate has to as well.
+        #
+        # Cells scale as (domain edge / characteristic cell size)^3. The estimate
+        # is deliberately crude -- it only has to catch the runaways, and the
+        # calibrated default lands ~4 orders of magnitude below the cap.
+        # Two terms, because gmsh meshes FINE near the body and COARSE in the far
+        # field, and either can dominate:
+        #   bulk  = (domain edge / mesh_size_max)^3   -- the far field
+        #   near  = (characteristic length / mesh_size_min)^3  -- around the aircraft
+        # A single-term estimate is degenerate: the first version of this check
+        # returned 1,000,000 for the calibrated default AND for the original
+        # 21-minute runaway, so it would have caught nothing.
+        #
+        # Validated against known cases (D150, char_length 16.96):
+        #   calibrated default        260,554   (observed actual 112k-350k) -> allow
+        #   moderate refine         1,544,952                               -> allow
+        #   original runaway        5,484,671   (ran 21 min, 14.7 GB)       -> refuse
+        #   the 2026-08-27 hang    17,921,895   (blocked 15+ min)           -> refuse
+        _edge = 2 * ff
+        _est_cells = (_edge / size_max) ** 3 + (char_length / size_min) ** 3
+        stats["estimated_cells"] = int(_est_cells)
+        if _est_cells > MAX_ESTIMATED_CELLS:
+            raise MCPError(
+                "mesh_too_large",
+                f"Refusing this mesh: estimated ~{int(_est_cells):,} cells exceeds the "
+                f"{MAX_ESTIMATED_CELLS:,} cap. Meshing blocks this server entirely while it "
+                f"runs, so an over-large request takes geometry offline for every caller "
+                f"(measured: 21 minutes and 14.7 GB, never completing). "
+                f"Requested far_field_distance={params.far_field_distance} "
+                f"(domain edge {_edge:.1f} m), mesh_size_min={size_min}, "
+                f"mesh_size_max={size_max}. "
+                f"To fix: OMIT mesh_size_min, mesh_size_max and far_field_distance to use the "
+                f"calibrated defaults (far_field_distance=10.0, "
+                f"mesh_size_min={round(char_length * 0.0176, 4)}, "
+                f"mesh_size_max={round(char_length * 0.47, 3)}), which produce a good ~350k-cell "
+                f"mesh in about a minute. If you need a finer mesh, reduce far_field_distance "
+                f"first -- it is cubic in cost."
+            )
 
         gmsh.model.mesh.generate(3)
 

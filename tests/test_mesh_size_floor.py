@@ -73,3 +73,61 @@ class TestTheFloorScalesWithGeometry:
         default = char_len * 0.0176
         assert floor < default
         assert floor == pytest.approx(default / 2, rel=0.01)
+
+
+class TestTheCostCapCatchesWhatTheClampMissed:
+    """Clamping mesh_size_min alone was NOT enough.
+
+    Measured 2026-08-27, AFTER the clamp shipped: an agent reached the same hang
+    through the other two knobs --
+
+        mesh_size_min=0.1 (clamped to 0.1492), mesh_size_max=2.0, far_field_distance=15.0
+
+    A 3x larger domain meshed ~4x more finely at the boundary. tigl stopped
+    answering for 15+ minutes and the sweep was lost. Cost depends on the DOMAIN
+    and BOTH size bounds, so a single-parameter clamp can always be routed around.
+    """
+
+    from tigl_mcp.tools.volume_mesh import MAX_ESTIMATED_CELLS as CAP
+
+    @staticmethod
+    def estimate(char_length, far_field_distance, size_min, size_max):
+        """Mirror of the pre-flight estimate in _generate_volume_mesh_gmsh.
+
+        Two terms because gmsh meshes fine near the body and coarse in the far
+        field, and either can dominate. A single-term version was degenerate --
+        it returned 1,000,000 for the calibrated default AND for the 21-minute
+        runaway, so it caught nothing.
+        """
+        edge = 2 * far_field_distance * char_length
+        return (edge / size_max) ** 3 + (char_length / size_min) ** 3
+
+    def test_the_calibrated_default_passes_comfortably(self):
+        est = self.estimate(CHAR_LENGTH, 10.0, DEFAULT, round(CHAR_LENGTH * 0.47, 3))
+        assert est < self.CAP
+
+    def test_the_request_that_hung_the_server_is_refused(self):
+        """The exact arguments from the lost run."""
+        est = self.estimate(CHAR_LENGTH, 15.0, FLOOR, 2.0)
+        assert est > self.CAP
+
+    def test_the_earlier_runaway_shape_is_also_refused(self):
+        """far_field 5.0 with an unclamped 0.1 -- the original 21-minute call."""
+        est = self.estimate(CHAR_LENGTH, 5.0, 0.1, 2.0)
+        assert est > self.CAP
+
+    def test_a_moderate_finer_request_is_still_allowed(self):
+        """The cap must not make legitimate refinement impossible."""
+        est = self.estimate(CHAR_LENGTH, 10.0, FLOOR, round(CHAR_LENGTH * 0.47, 3))
+        assert est < self.CAP
+
+    def test_the_estimate_tracks_the_observed_default(self):
+        """The calibrated default really does produce ~112k-350k cells."""
+        est = self.estimate(CHAR_LENGTH, 10.0, DEFAULT, round(CHAR_LENGTH * 0.47, 3))
+        assert 100_000 < est < 500_000
+
+    def test_far_field_dominates_the_bulk_term_cubically(self):
+        """Why the error tells the agent to reduce far_field_distance FIRST."""
+        a = (2 * 5.0 * CHAR_LENGTH / 8.0) ** 3
+        b = (2 * 10.0 * CHAR_LENGTH / 8.0) ** 3
+        assert b / a == pytest.approx(8.0, rel=0.01)
