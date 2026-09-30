@@ -8,6 +8,7 @@ error rather than returning stub data.
 from __future__ import annotations
 
 import base64
+import logging
 import os
 import tempfile
 from typing import Any, Literal
@@ -17,6 +18,8 @@ from tigl_mcp.errors import MCPError, raise_component_not_found, raise_mcp_error
 from tigl_mcp.session_manager import SessionManager
 from tigl_mcp.tooling import ToolDefinition, ToolParameters
 from tigl_mcp.tools.common import require_session
+
+logger = logging.getLogger(__name__)
 
 try:
     import gmsh  # type: ignore[import-untyped]
@@ -147,6 +150,64 @@ def _export_brep_for_component(
             pass
 
 
+def _tigl3_aircraft(tigl_handle: TiglConfiguration) -> Any | None:
+    """The tigl3 CCPACSConfiguration behind our handle, or None if unavailable."""
+    tigl: Any = tigl_handle._tigl_handle
+    if tigl is None or not hasattr(tigl, "_handle"):
+        return None
+    try:
+        from tigl3 import configuration  # type: ignore[import-not-found]
+
+        manager = configuration.CCPACSConfigurationManager_get_instance()
+        return manager.get_configuration(tigl._handle.value)
+    except Exception:  # noqa: BLE001 - any failure means fall back to the legacy exporter
+        return None
+
+
+def _export_fused_brep_with_symmetries(tigl_handle: TiglConfiguration) -> bytes | None:
+    """Export the WHOLE aircraft, mirrored surfaces included (B115).
+
+    The legacy ``exportFusedBREP`` writes what CPACS literally defines: one wing and one
+    tailplane, because CPACS models a symmetric aircraft as one half plus ``symmetry="x-z-plane"``.
+    Measured on the D150 baseline -- ``apply_symmetries=False`` gives y -1.98..16.96,
+    ``apply_symmetries=True`` gives y -16.96..16.96 -- and every CFD solve run on this machine used
+    the former. Half the lift at the full wing's reference area, an asymmetric body, and a sealed
+    wing root: CL 0.05-0.22 where cruise needs ~0.57, and a converged, stable, NEGATIVE CD.
+
+    ``set_apply_symmetries`` is TiGL's own option for this; nothing is mirrored by hand.
+    Returns None if the tigl3 exporter is unavailable, so the caller can fall back.
+    """
+    aircraft = _tigl3_aircraft(tigl_handle)
+    if aircraft is None:
+        return None
+    try:
+        from tigl3 import exports  # type: ignore[import-not-found]
+
+        options = exports.BRepOptions()
+        options.set_apply_symmetries(True)
+        options.set_include_farfield(False)
+        exporter = exports.CTiglExportBrep(options)
+        exporter.add_fused_configuration(aircraft)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[B115] symmetric BREP export unavailable (%s); falling back", exc)
+        return None
+
+    with tempfile.NamedTemporaryFile(suffix=".brep", delete=False) as tmp:
+        tmp_path = tmp.name
+    try:
+        exporter.write(tmp_path)
+        with open(tmp_path, "rb") as fh:
+            return fh.read()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[B115] symmetric BREP export failed (%s); falling back", exc)
+        return None
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def _export_configuration_brep(tigl_handle: TiglConfiguration) -> bytes | None:
     """Export the entire fused configuration as OCC BREP via TiGL.
 
@@ -156,9 +217,16 @@ def _export_configuration_brep(tigl_handle: TiglConfiguration) -> bytes | None:
     tigl: Any = tigl_handle._tigl_handle
     if tigl is None:
         return None
+    # B115: the whole aircraft first. The legacy exporter below writes only the half CPACS
+    # defines, which is what every solve on this machine has been given.
+    symmetric = _export_fused_brep_with_symmetries(tigl_handle)
+    if symmetric:
+        return symmetric
     exporter = getattr(tigl, "exportFusedBREP", None)
     if exporter is None:
         return None
+    logger.warning("[B115] falling back to exportFusedBREP: mirrored surfaces will be MISSING, "
+                   "so the solve sees one wing and one tailplane")
     with tempfile.NamedTemporaryFile(suffix=".brep", delete=False) as tmp:
         tmp_path = tmp.name
     try:
