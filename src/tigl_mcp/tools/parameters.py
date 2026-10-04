@@ -45,6 +45,15 @@ def _fuselage_targets(params: dict[str, float]) -> tuple[float | None, float | N
     return length, diameter
 
 
+# Keys the morphs actually read (see _wing_targets / _fuselage_targets).
+_CHORD_KEYS = ("span", "root_chord", "tip_chord")
+_PRIMARY_KEYS = {"wing": {"area", "aspect_ratio", "sweep"}, "fuselage": {"length", "diameter"}}
+_GEOMETRY_KEYS = {
+    "wing": _PRIMARY_KEYS["wing"] | set(_CHORD_KEYS),
+    "fuselage": _PRIMARY_KEYS["fuselage"] | {"max_diameter", "radius", "section_radius"},
+}
+
+
 class GetParametersParams(ToolParameters):
     """Parameters for get_high_level_parameters."""
 
@@ -159,6 +168,22 @@ def set_high_level_parameters_tool(session_manager: SessionManager) -> ToolDefin
                     warnings.append(f"Geometry morph skipped: {exc.error}")
                 except Exception as exc:  # noqa: BLE001 - never fail the record on morph
                     warnings.append(f"Geometry morph failed: {exc}")
+
+            # B105: say which keys did NOT move the geometry instead of succeeding silently. The wing
+            # morph reads area / aspect_ratio / sweep, or span + root_chord + tip_chord together
+            # (area only); the fuselage morph reads length and a diameter (or radius).
+            geometry_keys = _GEOMETRY_KEYS.get(type_name)
+            if geometry_keys is not None:
+                ignored = sorted(k for k in params.updates if k not in geometry_keys)
+                if type_name == "wing" and any(k in params.updates for k in _CHORD_KEYS) and not all(
+                    k in component.parameters for k in _CHORD_KEYS
+                ):
+                    ignored = sorted(set(ignored) | {k for k in params.updates if k in _CHORD_KEYS})
+                if ignored:
+                    warnings.append(
+                        f"Ignored (not a geometry input for a {type_name}): {', '.join(ignored)}. "
+                        f"Inputs that reshape it: {', '.join(sorted(_PRIMARY_KEYS[type_name]))}."
+                    )
 
             result: dict[str, object] = {
                 "component_uid": component.uid,

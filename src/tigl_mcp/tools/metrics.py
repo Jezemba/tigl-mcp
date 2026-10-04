@@ -77,10 +77,16 @@ def _get_wing_summary_real(  # pragma: no cover
     except Exception:  # noqa: BLE001
         wetted_area = None
 
-    try:
-        sweep: float | None = tigl.wingGetSweep(wing_uid)
-    except Exception:  # noqa: BLE001
+    # TiGL has no sweep query (wingGetSweep does not exist), so sweep was always null. Measure the
+    # planform from the section chord points instead: taper, LE and quarter-chord sweep.
+    from tigl_mcp.tools.planform import measure_planform
+
+    planform = measure_planform(tigl, component.index) or {}
+    sweep: float | None = planform.get("sweep_quarter_chord_deg")
+    if sweep is None:
         sweep = component.parameters.get("sweep")
+    sym_factor = 2.0 if component.symmetry else 1.0
+    full_area = reference_area * sym_factor if reference_area else None
 
     try:
         dihedral: float | None = tigl.wingGetDihedral(wing_uid)
@@ -97,6 +103,15 @@ def _get_wing_summary_real(  # pragma: no cover
         "mac_length": mac_chord,
         "mac_quarter_chord": {"x": mac_x, "y": mac_y, "z": mac_z},
         "sweep_deg": sweep,
+        "sweep_le_deg": planform.get("sweep_le_deg"),
+        "sweep_quarter_chord_deg": planform.get("sweep_quarter_chord_deg"),
+        "taper_ratio": planform.get("taper_ratio"),
+        "root_chord_m": planform.get("root_chord_m"),
+        "tip_chord_m": planform.get("tip_chord_m"),
+        # reference_area / aspect_ratio above stay HALF-wing for a symmetric wing (existing callers
+        # convert them); these two are the full-wing values the design space uses.
+        "full_reference_area": full_area,
+        "full_aspect_ratio": (span**2) / full_area if full_area else None,
         "dihedral_deg": dihedral,
         "symmetry": component.symmetry,
     }
@@ -230,8 +245,24 @@ def get_fuselage_summary_tool(session_manager: SessionManager) -> ToolDefinition
             # NOTE: Real TiGL fuselage calls (fuselageGetVolume, etc.)
             # segfault on some CPACS files (e.g. D150_simple.xml) — the
             # C++ crash kills the server process before Python's try/except
-            # can catch it.  Always use stub calculations for fuselage
-            # until the upstream TiGL bug is resolved.
+            # can catch it. Length, width and height are measured instead from
+            # the exported BREP's bounding box (OpenCASCADE), the same
+            # measurement morph_fuselage reports in its before/after blocks.
+            if tigl_handle._tigl_handle is not None:  # pragma: no cover - needs TiGL
+                from tigl_mcp.tools.morph import _fuselage_dims
+
+                dims = _fuselage_dims(tigl_handle._tigl_handle, component.uid)
+                if dims.get("length") is not None:
+                    return {
+                        "length": dims["length"],
+                        "max_width": dims["width"],
+                        "max_height": dims["height"],
+                        "max_diameter": max(dims["width"], dims["height"]),
+                        "wetted_area": component.parameters.get("wetted_area"),
+                        "max_cross_section_area": None,
+                        "approx_volume": None,
+                        "measured": True,
+                    }
 
             # Stub / fallback calculations
             length = component.parameters.get("length", 15.0 + component.index)

@@ -83,15 +83,17 @@ def _measure(
         mac_length = tigl.wingGetMAC(wing_uid)[0]
     except Exception:  # noqa: BLE001
         mac_length = None
-    try:
-        sweep_deg: float | None = tigl.wingGetSweep(wing_uid)
-    except Exception:  # noqa: BLE001
-        sweep_deg = None
+    # Measured planform (TiGL has no sweep query): the ACHIEVED sweep and taper, not the request.
+    from tigl_mcp.tools.planform import measure_planform
+
+    planform = measure_planform(tigl, wing_index) or {}
     return {
         "span": span,
         "reference_area": reference_area,
         "aspect_ratio": aspect_ratio,
-        "sweep_deg": sweep_deg,
+        "sweep_deg": planform.get("sweep_quarter_chord_deg"),
+        "sweep_le_deg": planform.get("sweep_le_deg"),
+        "taper_ratio": planform.get("taper_ratio"),
         "mac_length": mac_length,
     }
 
