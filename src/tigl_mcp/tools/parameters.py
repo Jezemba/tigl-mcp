@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from tigl_mcp.errors import MCPError, raise_component_not_found, raise_mcp_error
 from tigl_mcp.session_manager import SessionManager
 from tigl_mcp.tooling import ToolDefinition, ToolParameters
@@ -91,17 +93,65 @@ def _apply_update(current: float | None, update_value: float | str) -> float:
     raise_mcp_error("UpdateError", "Unsupported update type")
 
 
+_MEASURED_NOTE = {
+    "wing": ("Measured from the current geometry. area, aspect_ratio and span are the full wing (both halves). "
+             "sweep is the measured quarter-chord sweep, the value set_high_level_parameters reports after a "
+             "reshape; the sweep you pass to set_high_level_parameters sets the sections' positioning angle, "
+             "so the measured value differs from it."),
+    "fuselage": "Measured from the current geometry (bounding box). diameter is the larger of max_width and max_height.",
+}
+
+
+def _measured_parameters(tigl_handle: Any, component: Any) -> dict[str, float] | None:
+    """The component's current geometry, measured, under the keys set_high_level_parameters takes (Avion B145).
+
+    A real CPACS component carries no numeric XML attributes, so ``component.parameters`` was
+    empty for every D150 component until something was set -- the tool returned
+    ``{"parameters": {}}`` for Wing1, Wing2H, Wing3V and Fuselage1. Uses the same measurements
+    as set_high_level_parameters' geometry_morph (wing) and get_fuselage_summary (fuselage).
+    Returns None without a real TiGL handle (stub sessions keep the recorded values).
+    """
+    native = getattr(tigl_handle, "_tigl_handle", None)
+    if native is None:
+        return None
+    type_name = (component.type_name or "").lower()
+    try:  # pragma: no cover - needs TiGL
+        if type_name == "wing":
+            from tigl_mcp.tools.morph import _measure
+
+            m = _measure(native, component.uid, component.index, 2.0 if component.symmetry else 1.0)
+            out = {"area": m.get("reference_area"), "aspect_ratio": m.get("aspect_ratio"),
+                   "span": m.get("span"), "sweep": m.get("sweep_deg"), "taper_ratio": m.get("taper_ratio")}
+        elif type_name == "fuselage":
+            from tigl_mcp.tools.morph import _fuselage_dims
+
+            d = _fuselage_dims(native, component.uid)
+            w, h = d.get("width"), d.get("height")
+            out = {"length": d.get("length"), "max_width": w, "max_height": h,
+                   "diameter": max(w, h) if w is not None and h is not None else None}
+        else:
+            return None
+    except Exception:  # noqa: BLE001 - fall back to the recorded values rather than fail the call
+        return None
+    out = {k: float(v) for k, v in out.items() if v is not None}
+    return out or None
+
+
 def get_high_level_parameters_tool(session_manager: SessionManager) -> ToolDefinition:
     """Create the get_high_level_parameters tool."""
 
     def handler(raw_params: dict[str, object]) -> dict[str, object]:
         try:
             params = GetParametersParams.model_validate(raw_params)
-            _, _, config = require_session(session_manager, params.session_id)
+            _, tigl_handle, config = require_session(session_manager, params.session_id)
             component = config.find_component(params.component_uid)
             if component is None:
                 raise_component_not_found(config, params.component_uid)
-            return {"component_uid": component.uid, "parameters": component.parameters}
+            measured = _measured_parameters(tigl_handle, component)
+            if measured is None:
+                return {"component_uid": component.uid, "parameters": component.parameters}
+            return {"component_uid": component.uid, "parameters": {**component.parameters, **measured},
+                    "measured": True, "note": _MEASURED_NOTE.get((component.type_name or "").lower(), "")}
         except MCPError as error:
             raise error
         except Exception as exc:  # pragma: no cover - defensive path
@@ -109,7 +159,11 @@ def get_high_level_parameters_tool(session_manager: SessionManager) -> ToolDefin
 
     return ToolDefinition(
         name="get_high_level_parameters",
-        description="Return high-level design parameters for a component.",
+        description=(
+            "Return a component's current high-level parameters, measured from the geometry: for a wing "
+            "area, aspect_ratio and span (full wing), sweep (quarter-chord) and taper_ratio; for a fuselage "
+            "length, diameter, max_width and max_height."
+        ),
         parameters_model=GetParametersParams,
         handler=handler,
         output_schema={},
