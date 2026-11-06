@@ -17,6 +17,7 @@ from tigl_mcp.cpacs import ComponentDefinition, TiglConfiguration
 from tigl_mcp.errors import MCPError, raise_component_not_found, raise_mcp_error
 from tigl_mcp.session_manager import SessionManager
 from tigl_mcp.tooling import ToolDefinition, ToolParameters
+from tigl_mcp.tools import mesh_deformation
 from tigl_mcp.tools.common import require_session
 
 logger = logging.getLogger(__name__)
@@ -645,6 +646,37 @@ def _generate_volume_mesh_gmsh(
                 pass
 
 
+# Mesh-size and boundary-layer settings belong to the anchor mesh in deformation mode (Avion B241).
+_ANCHOR_OWNED_SETTINGS = ("far_field_distance", "mesh_size_min", "mesh_size_max", "surface_mesh_size",
+                          "boundary_layer_enabled", "boundary_layer_thickness", "boundary_layer_layers",
+                          "boundary_layer_growth")
+
+
+def _deformed_reply(params: GenerateVolumeMeshParams, tigl_handle: TiglConfiguration,
+                    anchor_dir: str) -> dict[str, object]:
+    """generate_volume_mesh in deformation mode: the anchor mesh deformed to this session's geometry."""
+    if params.component_uid is not None:
+        raise_mcp_error("MeshError", "Deformation mode meshes the whole aircraft; component_uid is not supported "
+                                     f"(got {params.component_uid!r}).")
+    if params.output_format != "su2":
+        raise_mcp_error("MeshError", "Deformation mode writes SU2 meshes only.")
+    try:
+        mesh_bytes, stats = mesh_deformation.deformed_mesh_for(tigl_handle._tigl_handle, anchor_dir)
+    except mesh_deformation.DeformationError as exc:
+        raise_mcp_error("MeshError", f"Mesh deformation failed: {exc}")
+    # The transport fills every field, so "sent" means "differs from the default".
+    fields = GenerateVolumeMeshParams.model_fields
+    stats["mesh_settings_ignored"] = sorted(k for k in _ANCHOR_OWNED_SETTINGS
+                                            if getattr(params, k) != fields[k].default)
+    logger.info("[B241] deformed anchor mesh: %s", {k: v for k, v in stats.items() if k != "workdir"})
+    return {
+        "format": "su2",
+        "mesh_base64": base64.b64encode(mesh_bytes).decode("utf-8"),
+        "mesh_size_bytes": len(mesh_bytes),
+        "statistics": stats,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Tool factory
 # ---------------------------------------------------------------------------
@@ -672,6 +704,12 @@ def generate_volume_mesh_tool(session_manager: SessionManager) -> ToolDefinition
                     "ExportError",
                     "Volume mesh requires real TiGL bindings (not stub mode).",
                 )
+
+            # Avion B241: with an anchor configured, deform the ONE anchor mesh to this geometry instead of
+            # re-meshing it (re-meshing moved SU2's drag by +-20-30 % between near-identical designs).
+            anchor_dir = mesh_deformation.anchor_dir_from_env()
+            if anchor_dir is not None:
+                return _deformed_reply(params, tigl_handle, anchor_dir)
 
             # Prefer TiGL's native BREP (parametric CAD, watertight) and
             # fall back to STL (tessellation) only when BREP is unavailable.
