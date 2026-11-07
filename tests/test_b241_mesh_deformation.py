@@ -197,8 +197,8 @@ def test_design_too_far_reads_as_an_instruction_the_agent_can_follow(monkeypatch
         '{"baseline_planform": {"Wing1": {"area_m2": 122.78, "aspect_ratio": 9.37, "sweep_setting_deg": 27.33}}}')
 
     def far(tigl, anchor):
-        raise md.DesignTooFar("the wing root would move 2.10 m along the fuselage and the surface would fold",
-                              {"junction_move_max_m": 2.1})
+        raise md.DesignTooFar("the root of Wing1 would move 2.10 m along the fuselage and the surface would fold",
+                              {"component": "Wing1", "junction_move_max_m": 2.1})
 
     monkeypatch.setattr(md, "deformed_mesh_for", far)
     with pytest.raises(MCPError) as info:
@@ -213,3 +213,51 @@ def test_design_too_far_reads_as_an_instruction_the_agent_can_follow(monkeypatch
 def test_tool_failure_says_it_is_not_the_design():
     msg = md.agent_message(md.DeformationError("SU2_DEF failed (exit 1)"))
     assert "not because of your design" in msg and "will not help" in msg
+
+
+def test_refusal_text_starts_with_its_type_and_quotes_the_component_it_names(tmp_path):
+    """Envelope 2026-11-07: the MCP client gets only the message text (not the error type), and an htail change was
+    reported as 'the wing root'. The text now starts with the type and quotes the named component's baseline."""
+    (tmp_path / md.META_FILE).write_text(
+        '{"baseline_planform": {"Wing1": {"area_m2": 122.78, "aspect_ratio": 9.37, "sweep_setting_deg": 27.33},'
+        ' "Wing2H": {"area_m2": 31.0, "aspect_ratio": 4.5, "sweep_setting_deg": 32.21}}}')
+    exc = md.DesignTooFar("the root of Wing2H would move 0.60 m along the fuselage", {"component": "Wing2H"})
+    msg = md.agent_message(exc, tmp_path)
+    assert msg.startswith("MeshDeformationRefused: ")
+    assert "baseline Wing2H is area 31.0" in msg and "Wing1" not in msg
+    assert md.agent_message(md.DeformationError("x")).startswith("MeshDeformationToolFailure: ")
+
+
+def test_refusal_without_planform_metadata_still_goes_out(tmp_path):
+    (tmp_path / md.META_FILE).write_text('{"nelem": 1}')          # older anchor, no CPACS next to it
+    msg = md.agent_message(md.DesignTooFar("the root of Wing1 would move 2 m"), tmp_path)
+    assert msg.startswith("MeshDeformationRefused: ") and "call generate_volume_mesh again" in msg
+
+
+def test_fold_is_attributed_to_the_nearest_junction_component():
+    anchor = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0], [10, 0, 0], [11, 0, 0], [10, 1, 0]], dtype=float)
+    new = anchor.copy()
+    new[3:] += [0.6, 0, 0]                                           # the tail's root moves 0.6 m
+    junctions = np.zeros(2, dtype=md._JUNCTION_DTYPE)
+    junctions["node"], junctions["wing"] = [0, 3], [0, 1]
+    comps = [{"name": "wing:Wing1"}, {"name": "wing:Wing2H"}]
+    name, move = md._folding_component(np.array([[3, 4, 5]]), anchor, new, junctions, comps)
+    assert name == "Wing2H" and move == pytest.approx(0.6)
+
+
+def test_illinois_finds_the_bracketed_root_in_few_evaluations():
+    calls = []
+
+    def f(x):
+        calls.append(x)
+        return (x - 0.3137) * (1.0 + 4.0 * x)          # smooth, like a signed distance across a surface
+
+    root = md._illinois(f, 0.0, f(0.0), 1.0, f(1.0))
+    assert abs(f(root)) <= md.SLIDE_TOL_M and len(calls) < 20       # bisection to 1e-12 needs ~40
+
+
+def test_anchor_from_another_junction_procedure_is_a_tool_failure(tmp_path):
+    (tmp_path / md.META_FILE).write_text('{"nelem": 1}')            # no procedure stamp: older anchor
+    with pytest.raises(md.DeformationError, match="re-run `prepare`") as info:
+        md.surface_positions(tmp_path, None)
+    assert not isinstance(info.value, md.DesignTooFar)

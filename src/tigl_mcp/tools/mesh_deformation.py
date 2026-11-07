@@ -47,6 +47,8 @@ CAP_NEIGHBOURS = 4
 JUNCTION_BAND_M = 0.05       # a wing node this close to a fuselage in the anchor is a junction node
 JUNCTION_TOL_M = 1e-4
 MAP_FILE, MESH_FILE, CPACS_FILE, META_FILE = "anchor_map.npz", "anchor.su2", "anchor.xml", "anchor.json"
+# Bump when the junction procedure changes: an anchor is only exact for the procedure that prepared it.
+ANCHOR_PROCEDURE = "illinois-slide-1"
 
 _REC_DTYPE = [("comp", "i4"), ("face", "i4"), ("u", "f8"), ("v", "f8"), ("mirror", "i1"), ("dist", "f8")]
 _JUNCTION_DTYPE = [("node", "i4"), ("wing", "i4"), ("fuselage", "i4"), ("g", "f8"), ("xsi", "f8"), ("top", "i1")]
@@ -93,23 +95,38 @@ def baseline_planform(cpacs_path: str | os.PathLike, tigl: Any, cfg: Any) -> dic
 def agent_message(exc: DeformationError, anchor_dir: str | os.PathLike | None = None) -> str:
     """The text an agent reads when generate_volume_mesh cannot deform to its design (or the tool failed)."""
     if not isinstance(exc, DesignTooFar):
-        return ("Mesh not generated because of a TOOL failure, not because of your design: " + str(exc)
+        return ("MeshDeformationToolFailure: Mesh not generated because of a TOOL failure, not because of your design: " + str(exc)
                 + ". Your geometry is unchanged. Calling generate_volume_mesh again will not help.")
     base = ""
-    try:
-        planform = json.loads((Path(anchor_dir) / META_FILE).read_text()).get("baseline_planform") or {}
-        w = planform.get("Wing1")
-        if w:
-            base = (f" The baseline main wing (Wing1) is area {w['area_m2']} m^2, aspect ratio {w['aspect_ratio']}"
-                    + (f", sweep setting {w['sweep_setting_deg']} deg" if w.get("sweep_setting_deg") is not None
-                       else "") + ".")
-    except (OSError, ValueError, TypeError):
-        pass
-    return ("Mesh not generated: this design is too far from the study's baseline geometry for the CFD mesh to "
-            "follow it. Every design in this study is meshed by deforming one baseline mesh, and here "
-            f"{exc.reason}. Your geometry in this tigl session is unchanged, but it has no mesh, so SU2 cannot run "
-            "on it. To get a mesh, change the design back toward the baseline (a smaller change in wing area, "
+    planform = _baseline_planform_of(anchor_dir)
+    uid = exc.measured.get("component") if exc.measured.get("component") in planform else "Wing1"
+    w = planform.get(uid)
+    if w:
+        base = (f" The baseline {uid} is area {w['area_m2']} m^2, aspect ratio {w['aspect_ratio']}"
+                + (f", sweep setting {w['sweep_setting_deg']} deg" if w.get("sweep_setting_deg") is not None
+                   else "") + ".")
+    # The MCP client receives only this text (not the error type), so the text starts with the type name: agents
+    # read it and study logs count refusals by it.
+    return ("MeshDeformationRefused: Mesh not generated: this design is too far from the study's baseline geometry "
+            "for the CFD mesh to follow it. Every design in this study is meshed by deforming one baseline mesh, and "
+            f"here {exc.reason}. Your geometry in this tigl session is unchanged, but it has no mesh, so SU2 cannot "
+            "run on it. To get a mesh, change the design back toward the baseline (a smaller change in wing area, "
             f"aspect ratio, sweep or tail size) and call generate_volume_mesh again.{base}")
+
+
+def _baseline_planform_of(anchor_dir: str | os.PathLike | None) -> dict:
+    """The anchor's baseline planform: from its metadata, else measured from the anchor CPACS (anchors prepared
+    before the metadata carried it)."""
+    if not anchor_dir:
+        return {}
+    try:
+        planform = json.loads((Path(anchor_dir) / META_FILE).read_text()).get("baseline_planform")
+        if planform:
+            return planform
+        handle = open_cpacs(Path(anchor_dir) / CPACS_FILE)
+        return baseline_planform(Path(anchor_dir) / CPACS_FILE, handle[1], handle[2])
+    except Exception:          # the message must still go out without the numbers
+        return {}
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -253,7 +270,13 @@ def _signed_distance(p: np.ndarray, comp: dict) -> float:
     near = [s for s, b in zip(comp["surfaces"], comp["boxes"])
             if not (np.any(p < b[:3] - 1.0) or np.any(p > b[3:] + 1.0))] or comp["surfaces"]
     best = min((h[0] for h in (_project(p, s) for s in near) if h is not None), default=np.inf)
-    inside = BRepClass3d_SolidClassifier(comp["shape"], gp_Pnt(*map(float, p)), 1e-7).State() == TopAbs_IN
+    # Loading the solid into a classifier costs ~41 ms; it was rebuilt on every call (91 % of a design's 13 min,
+    # profile 2026-11-07). Load once per component and classify each point with Perform (same algorithm).
+    classifier = comp.get("_classifier")
+    if classifier is None:
+        classifier = comp["_classifier"] = BRepClass3d_SolidClassifier(comp["shape"])
+    classifier.Perform(gp_Pnt(*map(float, p)), 1e-7)
+    inside = classifier.State() == TopAbs_IN
     return -best if inside else best
 
 
@@ -293,12 +316,13 @@ def slide_junction(tigl: Any, wing: dict, fus: dict, j: np.void, search: float =
     def f(g: float) -> float:
         return _signed_distance(_wing_point(tigl, wing["index"], g, float(j["xsi"]), int(j["top"]), nseg), fus)
 
-    # Always the same procedure to full precision (no early stop on a tolerance): the anchor's own junction point is
-    # computed with it too, and a node moves by the DIFFERENCE, so any procedural difference would show up as a
-    # spurious displacement of the anchor onto itself.
+    # Always the same deterministic procedure: the anchor's own junction point is computed with it too, and a node
+    # moves by the DIFFERENCE, so any procedural difference would show up as a spurious displacement of the anchor
+    # onto itself (an anchor must be prepared with the same version of this function that deforms from it).
     g0 = float(j["g"])
     f0 = f(g0)
     if f0 == 0.0:
+        slide_junction.last_g = g0
         return _wing_point(tigl, wing["index"], g0, float(j["xsi"]), int(j["top"]), nseg), 0.0
     # Bracket outwards from g0 with geometrically growing steps, clamped to the wing's [0, nseg]: a root junction
     # sits close to g = 0, so a fixed step that skips "g < 0" can step over the crossing entirely (seen on Wing3V,
@@ -307,25 +331,55 @@ def slide_junction(tigl: Any, wing: dict, fus: dict, j: np.void, search: float =
     d = 0.001
     while lo is None and d <= search * 1.5:
         for g in (max(0.0, g0 - d), min(float(nseg), g0 + d)):
-            if g != g0 and np.sign(f(g)) != np.sign(f0):
-                lo, hi = (g, g0) if g < g0 else (g0, g)
+            if g == g0:
+                continue
+            fg = f(g)
+            if np.sign(fg) != np.sign(f0):
+                (lo, flo), (hi, fhi) = ((g, fg), (g0, f0)) if g < g0 else ((g0, f0), (g, fg))
                 break
         d *= 1.5
     if lo is None:
         name = wing["name"].split(":")[-1]
         raise DesignTooFar(f"the root of {name} no longer meets the fuselage where the baseline mesh joins them",
                            {"component": name, "junction_g": round(g0, 4), "junction_xsi": round(float(j["xsi"]), 4)})
-    flo = f(lo)
-    for _ in range(60):
-        mid = 0.5 * (lo + hi)
-        fm = f(mid)
-        if fm == 0.0 or hi - lo < 1e-12:
-            break
-        lo, hi, flo = (mid, hi, fm) if np.sign(fm) == np.sign(flo) else (lo, mid, flo)
-    g_hit = 0.5 * (lo + hi)
+    g_hit = _illinois(f, lo, flo, hi, fhi)
     pt = _wing_point(tigl, wing["index"], g_hit, float(j["xsi"]), int(j["top"]), nseg)
     slide_junction.last_g = g_hit                  # the intersection's spanwise coordinate, for the root stretch
     return pt, abs(_signed_distance(pt, fus))
+
+
+SLIDE_TOL_M = 1e-7          # = the solid classifier's tolerance: the distance cannot be resolved more finely
+SLIDE_TOL_G = 1e-12
+
+
+def _illinois(f: Any, lo: float, flo: float, hi: float, fhi: float, maxiter: int = 100) -> float:
+    """Root of f in the sign-change bracket [lo, hi] by Illinois regula falsi (always bracketed, superlinear).
+
+    Plain bisection to 1e-12 took ~39 signed-distance evaluations per junction slide, each with a fuselage
+    inside/outside classification (profile 2026-11-07: 91 % of a design's 13 min); the signed distance is smooth
+    across the surface, so a secant-type step needs a handful."""
+    side = 0
+    mid = 0.5 * (lo + hi)
+    for _ in range(maxiter):
+        mid = (lo * fhi - hi * flo) / (fhi - flo)
+        if not lo < mid < hi:
+            mid = 0.5 * (lo + hi)
+        fm = f(mid)
+        if abs(fm) <= SLIDE_TOL_M:
+            return mid
+        if np.sign(fm) == np.sign(flo):
+            lo, flo = mid, fm
+            if side == -1:
+                fhi *= 0.5
+            side = -1
+        else:
+            hi, fhi = mid, fm
+            if side == 1:
+                flo *= 0.5
+            side = 1
+        if hi - lo < SLIDE_TOL_G:
+            return 0.5 * (lo + hi)
+    return mid
 
 
 slide_junction.last_g = 0.0
@@ -390,7 +444,7 @@ def prepare_anchor(mesh_path: str | os.PathLike, cpacs_path: str | os.PathLike, 
              junction_g=np.array(junction_g), wing_params=wp, root_g0=root_g0,
              tris=aircraft_triangles(out / MESH_FILE, ids),
              comp_names=np.array([c["name"] for c in comps]), face_counts=np.array([len(c["surfaces"]) for c in comps]))
-    meta = {"nelem": nelem, "npoin": int(len(points)), "aircraft_nodes": int(len(ids)),
+    meta = {"procedure": ANCHOR_PROCEDURE, "nelem": nelem, "npoin": int(len(points)), "aircraft_nodes": int(len(ids)),
             "junction_nodes": int(len(junctions)), "map_distance_max_m": float(rec["dist"].max()),
             "components": [c["name"] for c in comps], "seconds": round(time.time() - t0, 1),
             "source_mesh": str(mesh_path), "source_cpacs": str(cpacs_path),
@@ -403,6 +457,10 @@ def surface_positions(anchor_dir: str | os.PathLike, target_tigl: Any,
                       strict: bool = True) -> tuple[np.ndarray, np.ndarray, dict]:
     """(global node ids, new positions, stats) of the anchor's aircraft nodes on the target geometry."""
     d = Path(anchor_dir)
+    procedure = json.loads((d / META_FILE).read_text()).get("procedure")
+    if procedure != ANCHOR_PROCEDURE:
+        raise DeformationError(f"anchor {d} was prepared with junction procedure {procedure!r}, this server uses "
+                               f"{ANCHOR_PROCEDURE!r}; re-run `prepare` for this anchor")
     data = np.load(d / MAP_FILE)
     rec, ids, anchor, junctions = data["rec"], data["ids"], data["anchor_xyz"], data["junctions"]
     anchor_handle = open_cpacs(d / CPACS_FILE)
@@ -453,13 +511,29 @@ def surface_positions(anchor_dir: str | os.PathLike, target_tigl: Any,
     del anchor_handle
     stats["_flipped"] = flipped.tolist()       # for diagnosis; removed from the reply below
     if strict and len(flipped):
-        raise DesignTooFar(f"the wing root would move {stats['junction_move_max_m']:.2f} m along the fuselage and the "
-                           f"surface would fold at the wing-fuselage junction ({len(flipped)} of {len(tris)} surface "
-                           "triangles turn over)",
-                           {"surface_triangles_flipped": int(len(flipped)),
-                            "junction_move_max_m": round(stats["junction_move_max_m"], 3),
+        # Name the component whose junction folds (nearest junction node to the folded triangles): a tail change
+        # folds at the TAIL root, and "the wing root" would send the agent to the wrong component.
+        name, move = _folding_component(tris[np.asarray(flipped, dtype=int)], anchor, new, junctions, comps)
+        raise DesignTooFar(f"the root of {name} would move {move:.2f} m along the fuselage and the surface would "
+                           f"fold where {name} joins the fuselage ({len(flipped)} of {len(tris)} surface triangles "
+                           "turn over)",
+                           {"component": name, "surface_triangles_flipped": int(len(flipped)),
+                            "junction_move_max_m": round(move, 3),
                             "surface_displacement_max_m": round(stats["surface_displacement_max_m"], 3)})
     return ids, new, stats
+
+
+def _folding_component(tris: np.ndarray, anchor: np.ndarray, new: np.ndarray, junctions: np.ndarray,
+                       comps: list[dict]) -> tuple[str, float]:
+    """(component UID, its largest junction move in m) for the junction closest to the folded triangles."""
+    if not len(junctions):
+        return "the aircraft", 0.0
+    jnodes = junctions["node"].astype(int)
+    centres = anchor[tris].mean(axis=1)
+    nearest = np.argmin(np.linalg.norm(centres[:, None, :] - anchor[jnodes][None, :, :], axis=2), axis=1)
+    wing = int(np.bincount(junctions["wing"][nearest].astype(int)).argmax())
+    sel = jnodes[junctions["wing"] == wing]
+    return comps[wing]["name"].split(":")[-1], float(np.linalg.norm(new[sel] - anchor[sel], axis=1).max())
 
 
 ROOT_ZONE_MIN_G = 0.3          # the stretched strip next to the junction is at least this wide in g
