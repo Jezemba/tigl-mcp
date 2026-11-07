@@ -662,8 +662,14 @@ def _deformed_reply(params: GenerateVolumeMeshParams, tigl_handle: TiglConfigura
         raise_mcp_error("MeshError", "Deformation mode writes SU2 meshes only.")
     try:
         mesh_bytes, stats = mesh_deformation.deformed_mesh_for(tigl_handle._tigl_handle, anchor_dir)
+    except mesh_deformation.DesignTooFar as exc:
+        # Avion B241 (Jessica 2026-11-07): not blocked up front; the agent gets a readable reason and how to
+        # recover, and the distinct error type lets the study count these refusals.
+        raise_mcp_error("MeshDeformationRefused", mesh_deformation.agent_message(exc, anchor_dir),
+                        details={"error_code": "MESH_DEFORMATION_REFUSED", "measured": exc.measured})
     except mesh_deformation.DeformationError as exc:
-        raise_mcp_error("MeshError", f"Mesh deformation failed: {exc}")
+        raise_mcp_error("MeshError", mesh_deformation.agent_message(exc, anchor_dir),
+                        details={"error_code": "MESH_DEFORMATION_TOOL_FAILURE"})
     # The transport fills every field, so "sent" means "differs from the default".
     fields = GenerateVolumeMeshParams.model_fields
     stats["mesh_settings_ignored"] = sorted(k for k in _ANCHOR_OWNED_SETTINGS

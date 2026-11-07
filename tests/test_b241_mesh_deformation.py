@@ -72,7 +72,7 @@ def test_inverted_cells_are_refused_not_returned(tmp_path, monkeypatch):
     script.write_text("#!/bin/sh\ncp \"$(sed -n 's/^MESH_FILENAME= //p' $1)\" mesh_def.su2\n"
                       "echo 'There are 3 elements with negative volume.'\necho 'Min. volume: -2e-07.'\n")
     script.chmod(0o755)
-    with pytest.raises(md.DeformationError, match="inverted"):
+    with pytest.raises(md.DesignTooFar, match="inside out"):
         md.deform_mesh(tmp_path, np.array([0]), np.zeros((1, 3)), su2_def=str(script), launch="")
 
 
@@ -116,10 +116,10 @@ def test_deformation_failure_is_a_mesh_error_not_a_silent_remesh(monkeypatch):
     from tigl_mcp.tools import volume_mesh as vm
 
     def boom(tigl, anchor):
-        raise md.DeformationError("too far from the anchor")
+        raise md.DeformationError("SU2_DEF not found")
 
     monkeypatch.setattr(md, "deformed_mesh_for", boom)
-    with pytest.raises(MCPError, match="too far from the anchor"):
+    with pytest.raises(MCPError, match="TOOL failure"):
         vm._deformed_reply(vm.GenerateVolumeMeshParams(session_id="s"), _Handle(), "/anchor")
     with pytest.raises(MCPError, match="component_uid"):
         vm._deformed_reply(vm.GenerateVolumeMeshParams(session_id="s", component_uid="Wing1"), _Handle(), "/a")
@@ -185,5 +185,31 @@ def test_reswept_wing_junction_does_not_fold_the_surface():
     if not design.exists():
         pytest.skip("needs cpacs/eval_baseline_reswept.xml")
     _, _, stats = md.surface_positions(GEO, md.open_cpacs(design)[1])
-    assert stats["surface_triangles_flipped"] == 0 and stats["junction_blended_nodes"] > 0
-    assert stats["junction_slide_max_m"] > 0.5
+    assert stats["surface_triangles_flipped"] == 0 and stats["fuselage_nodes_following_junction"] > 0
+    assert stats["junction_move_max_m"] > 0.5
+
+
+def test_design_too_far_reads_as_an_instruction_the_agent_can_follow(monkeypatch, tmp_path):
+    """Jessica 2026-11-07: never block up front (the refusal rate is measured); the agent gets a readable reason."""
+    from tigl_mcp.tools import volume_mesh as vm
+
+    (tmp_path / md.META_FILE).write_text(
+        '{"baseline_planform": {"Wing1": {"area_m2": 122.78, "aspect_ratio": 9.37, "sweep_setting_deg": 27.33}}}')
+
+    def far(tigl, anchor):
+        raise md.DesignTooFar("the wing root would move 2.10 m along the fuselage and the surface would fold",
+                              {"junction_move_max_m": 2.1})
+
+    monkeypatch.setattr(md, "deformed_mesh_for", far)
+    with pytest.raises(MCPError) as info:
+        vm._deformed_reply(vm.GenerateVolumeMeshParams(session_id="s"), _Handle(), str(tmp_path))
+    payload = info.value.to_dict()
+    text = str(payload)
+    assert "MeshDeformationRefused" in text and "MESH_DEFORMATION_REFUSED" in text
+    assert "too far from the study's baseline" in text and "2.10 m" in text
+    assert "call generate_volume_mesh again" in text and "area 122.78" in text and "unchanged" in text
+
+
+def test_tool_failure_says_it_is_not_the_design():
+    msg = md.agent_message(md.DeformationError("SU2_DEF failed (exit 1)"))
+    assert "not because of your design" in msg and "will not help" in msg

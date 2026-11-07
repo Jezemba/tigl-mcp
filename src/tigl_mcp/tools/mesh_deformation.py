@@ -53,7 +53,63 @@ _JUNCTION_DTYPE = [("node", "i4"), ("wing", "i4"), ("fuselage", "i4"), ("g", "f8
 
 
 class DeformationError(RuntimeError):
-    """The design cannot be reached by deforming the anchor mesh (reason in the message)."""
+    """Deformation failed. The base class is a TOOL failure (missing SU2_DEF, bad anchor files ...)."""
+
+
+class DesignTooFar(DeformationError):
+    """The design itself is too far from the anchor for the mesh to follow it (Jessica 2026-11-07: never blocked up
+    front -- how often agents reach this is measured -- but the agent must get a message it can act on).
+
+    ``reason`` is one plain sentence about the geometry; ``measured`` the numbers behind it."""
+
+    def __init__(self, reason: str, measured: dict | None = None):
+        super().__init__(reason)
+        self.reason = reason
+        self.measured = measured or {}
+
+
+def baseline_planform(cpacs_path: str | os.PathLike, tigl: Any, cfg: Any) -> dict:
+    """Each wing's baseline area, aspect ratio (as tigl-mcp measures them) and its `sweep` setting (the largest
+    positioning sweep in the CPACS -- the value set_high_level_parameters' `sweep` writes)."""
+    import xml.etree.ElementTree as ET
+
+    from tigl_mcp.tools.morph import _measure
+
+    root = ET.parse(str(cpacs_path)).getroot()
+    sweeps = {}
+    for wing in root.iter("wing"):
+        vals = [float(p.findtext("sweepAngle") or 0.0) for p in wing.iter("positioning")]
+        sweeps[wing.get("uID")] = max(vals) if vals else None
+    out = {}
+    for i in range(1, cfg.get_wing_count() + 1):
+        w = cfg.get_wing(i)
+        uid = w.get_uid()
+        m = _measure(tigl, uid, i, 2.0 if int(w.get_symmetry_axis()) != 0 else 1.0)
+        out[uid] = {"area_m2": round(float(m["reference_area"]), 2), "aspect_ratio": round(float(m["aspect_ratio"]), 2),
+                    "sweep_setting_deg": sweeps.get(uid)}
+    return out
+
+
+def agent_message(exc: DeformationError, anchor_dir: str | os.PathLike | None = None) -> str:
+    """The text an agent reads when generate_volume_mesh cannot deform to its design (or the tool failed)."""
+    if not isinstance(exc, DesignTooFar):
+        return ("Mesh not generated because of a TOOL failure, not because of your design: " + str(exc)
+                + ". Your geometry is unchanged. Calling generate_volume_mesh again will not help.")
+    base = ""
+    try:
+        planform = json.loads((Path(anchor_dir) / META_FILE).read_text()).get("baseline_planform") or {}
+        w = planform.get("Wing1")
+        if w:
+            base = (f" The baseline main wing (Wing1) is area {w['area_m2']} m^2, aspect ratio {w['aspect_ratio']}"
+                    + (f", sweep setting {w['sweep_setting_deg']} deg" if w.get("sweep_setting_deg") is not None
+                       else "") + ".")
+    except (OSError, ValueError, TypeError):
+        pass
+    return ("Mesh not generated: this design is too far from the study's baseline geometry for the CFD mesh to "
+            "follow it. Every design in this study is meshed by deforming one baseline mesh, and here "
+            f"{exc.reason}. Your geometry in this tigl session is unchanged, but it has no mesh, so SU2 cannot run "
+            "on it. To get a mesh, change the design back toward the baseline (a smaller change in wing area, "
+            f"aspect ratio, sweep or tail size) and call generate_volume_mesh again.{base}")
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -256,8 +312,9 @@ def slide_junction(tigl: Any, wing: dict, fus: dict, j: np.void, search: float =
                 break
         d *= 1.5
     if lo is None:
-        raise DeformationError(f"no wing-fuselage intersection near the anchor junction (g {g0:.3f}, "
-                               f"xsi {float(j['xsi']):.3f}) -- the design is too far from the anchor")
+        name = wing["name"].split(":")[-1]
+        raise DesignTooFar(f"the root of {name} no longer meets the fuselage where the baseline mesh joins them",
+                           {"component": name, "junction_g": round(g0, 4), "junction_xsi": round(float(j["xsi"]), 4)})
     flo = f(lo)
     for _ in range(60):
         mid = 0.5 * (lo + hi)
@@ -265,8 +322,38 @@ def slide_junction(tigl: Any, wing: dict, fus: dict, j: np.void, search: float =
         if fm == 0.0 or hi - lo < 1e-12:
             break
         lo, hi, flo = (mid, hi, fm) if np.sign(fm) == np.sign(flo) else (lo, mid, flo)
-    pt = _wing_point(tigl, wing["index"], 0.5 * (lo + hi), float(j["xsi"]), int(j["top"]), nseg)
+    g_hit = 0.5 * (lo + hi)
+    pt = _wing_point(tigl, wing["index"], g_hit, float(j["xsi"]), int(j["top"]), nseg)
+    slide_junction.last_g = g_hit                  # the intersection's spanwise coordinate, for the root stretch
     return pt, abs(_signed_distance(pt, fus))
+
+
+slide_junction.last_g = 0.0
+
+
+_WING_PARAM_DTYPE = [("node", "i4"), ("g", "f8"), ("xsi", "f8"), ("top", "i1"), ("ok", "i1")]
+
+
+def wing_params(points: np.ndarray, rec: np.ndarray, comps: list[dict], tigl: Any) -> np.ndarray:
+    """TiGL (global eta g, xsi, upper/lower) of every wing node on a curved face, in the unmirrored frame.
+
+    ok = the parameters reproduce the node within 1 mm (else the node keeps the face mapping)."""
+    out = []
+    for k, r in enumerate(rec):
+        comp = comps[int(r["comp"])]
+        if comp["kind"] != "wing" or comp["planar"][int(r["face"])]:
+            continue
+        p = _mirror(points[k]) if r["mirror"] else points[k]
+        try:
+            seg, eta, xsi, top = tigl.wingGetSegmentEtaXsi(comp["index"], *map(float, p))
+        except Exception:  # noqa: BLE001 - TiGL refuses points it cannot place
+            out.append((k, 0.0, 0.0, 0, 0))
+            continue
+        g = (seg - 1) + eta
+        nseg = tigl.wingGetSegmentCount(comp["index"])
+        back = _wing_point(tigl, comp["index"], g, xsi, int(top), nseg)
+        out.append((k, g, xsi, int(top), int(np.linalg.norm(back - p) < 1e-3)))
+    return np.array(out, dtype=_WING_PARAM_DTYPE)
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -292,15 +379,22 @@ def prepare_anchor(mesh_path: str | os.PathLike, cpacs_path: str | os.PathLike, 
     junctions = find_junctions(points[ids], rec, comps, handle[1])
     # The anchor's own wing-fuselage intersection points: a junction node moves by (new - anchor) intersection,
     # so it keeps its offset from the junction curve and the anchor maps onto itself exactly.
-    junction_xyz = np.array([slide_junction(handle[1], comps[int(j["wing"])], comps[int(j["fuselage"])], j)[0]
-                             for j in junctions]).reshape(-1, 3)
+    junction_xyz, junction_g = [], []
+    for j in junctions:
+        junction_xyz.append(slide_junction(handle[1], comps[int(j["wing"])], comps[int(j["fuselage"])], j)[0])
+        junction_g.append(slide_junction.last_g)
+    junction_xyz = np.array(junction_xyz).reshape(-1, 3)
+    wp = wing_params(points[ids], rec, comps, handle[1])
+    root_g0 = _exact_root_g(wp, rec, comps, junctions, np.array(junction_g), handle[1])
     np.savez(out / MAP_FILE, ids=ids, rec=rec, anchor_xyz=points[ids], junctions=junctions, junction_xyz=junction_xyz,
+             junction_g=np.array(junction_g), wing_params=wp, root_g0=root_g0,
              tris=aircraft_triangles(out / MESH_FILE, ids),
              comp_names=np.array([c["name"] for c in comps]), face_counts=np.array([len(c["surfaces"]) for c in comps]))
     meta = {"nelem": nelem, "npoin": int(len(points)), "aircraft_nodes": int(len(ids)),
             "junction_nodes": int(len(junctions)), "map_distance_max_m": float(rec["dist"].max()),
             "components": [c["name"] for c in comps], "seconds": round(time.time() - t0, 1),
-            "source_mesh": str(mesh_path), "source_cpacs": str(cpacs_path)}
+            "source_mesh": str(mesh_path), "source_cpacs": str(cpacs_path),
+            "baseline_planform": baseline_planform(out / CPACS_FILE, handle[1], handle[2])}
     (out / META_FILE).write_text(json.dumps(meta, indent=2))
     return meta
 
@@ -329,72 +423,173 @@ def surface_positions(anchor_dir: str | os.PathLike, target_tigl: Any,
             disp[i] = disp[near].mean(axis=0)
     new = anchor + disp
 
+    # The wing-body junction on the target: each junction node's intersection with the fuselage, by spanwise g.
     residual = []
-    extra = np.zeros((len(junctions), 3))           # each junction node's slide beyond its own wing mapping
-    for n, (j, at_anchor) in enumerate(zip(junctions, data["junction_xyz"])):
-        k = int(j["node"])
-        pt, res = slide_junction(target_tigl, comps[int(j["wing"])], comps[int(j["fuselage"])], j)
-        shift = pt - at_anchor                      # in the unmirrored frame
-        new[k] = anchor[k] + (_mirror(shift) if rec["mirror"][k] else shift)
-        extra[n] = new[k] - (anchor[k] + disp[k])
+    g_target = np.zeros(len(junctions))
+    for n, j in enumerate(junctions):
+        _, res = slide_junction(target_tigl, comps[int(j["wing"])], comps[int(j["fuselage"])], j)
+        g_target[n] = slide_junction.last_g
         residual.append(res)
-    blended = _spread_junction_slide(rec, anchor, new, disp, junctions, extra, comps)
+    root = _root_stretch(rec, anchor, new, data, junctions, g_target, anchor_handle[1], target_tigl, comps)
+    # Cap nodes follow their (now final) curved neighbours.
+    for i in np.where(on_cap)[0]:
+        same = np.where(~on_cap & (rec["comp"] == rec["comp"][i]) & (rec["mirror"] == rec["mirror"][i]))[0]
+        if len(same):
+            near = same[np.argsort(np.linalg.norm(anchor[same] - anchor[i], axis=1))[:CAP_NEIGHBOURS]]
+            new[i] = anchor[i] + (new[near] - anchor[near]).mean(axis=0)
+    fus_moved = _fuselage_follow(rec, anchor, new, junctions, comps)
 
     tris = data["tris"] if "tris" in data.files else aircraft_triangles(d / MESH_FILE, ids)
     flipped = flipped_triangles(tris, anchor, new)
     moved = np.linalg.norm(new - anchor, axis=1)
+    jmove = moved[junctions["node"].astype(int)] if len(junctions) else np.zeros(1)
     stats = {"surface_nodes": int(len(ids)), "surface_displacement_max_m": float(moved.max()),
              "surface_displacement_mean_m": float(moved.mean()), "cap_nodes": int(on_cap.sum()),
              "junction_nodes": int(len(junctions)),
              "junction_residual_max_m": float(max(residual)) if residual else 0.0,
-             "junction_slide_max_m": float(np.linalg.norm(extra, axis=1).max()) if len(extra) else 0.0,
-             "junction_blended_nodes": blended, "surface_triangles_flipped": int(len(flipped))}
+             "junction_move_max_m": float(jmove.max()), "root_zone_nodes": root["zone"],
+             "wing_param_fallback_nodes": root["fallback"], "fuselage_nodes_following_junction": fus_moved,
+             "surface_triangles_flipped": int(len(flipped))}
     del anchor_handle
     stats["_flipped"] = flipped.tolist()       # for diagnosis; removed from the reply below
     if strict and len(flipped):
-        raise DeformationError(f"the deformed aircraft surface folds: {len(flipped)} of {len(tris)} surface "
-                               f"triangles flip (largest junction slide {stats['junction_slide_max_m']:.3f} m); "
-                               "the design is too far from the anchor mesh")
+        raise DesignTooFar(f"the wing root would move {stats['junction_move_max_m']:.2f} m along the fuselage and the "
+                           f"surface would fold at the wing-fuselage junction ({len(flipped)} of {len(tris)} surface "
+                           "triangles turn over)",
+                           {"surface_triangles_flipped": int(len(flipped)),
+                            "junction_move_max_m": round(stats["junction_move_max_m"], 3),
+                            "surface_displacement_max_m": round(stats["surface_displacement_max_m"], 3)})
     return ids, new, stats
 
 
-def _spread_junction_slide(rec: np.ndarray, anchor: np.ndarray, new: np.ndarray, disp: np.ndarray,
-                           junctions: np.ndarray, extra: np.ndarray, comps: list[dict]) -> int:
-    """Spread the junction slide to nearby nodes of the same wing and of the fuselage, then put them back on their
-    own (morphed) surface. Without it a junction node slides past its fixed neighbours and the surface folds
-    (2026-11-06: 0.72 m slide on the re-swept wing -> 44 flipped surface triangles). In place; returns the count."""
-    # Two motions reach the neighbours (2026-11-06 fold diagnosis): wing nodes near the root get the junction's EXTRA
-    # slide (they already follow the wing mapping); FUSELAGE nodes near the junction get the junction nodes' TOTAL
-    # move -- the wing root itself moves 0.45-0.7 m along the body when the inboard sections are re-swept or the
-    # root chord changes, and a fixed fuselage row next to it folds (13-43 flipped triangles from the mapping alone).
+ROOT_ZONE_MIN_G = 0.3          # the stretched strip next to the junction is at least this wide in g
+ROOT_ZONE_FACTOR = 3.0         # ... and at least this many times the junction's own spanwise move
+ROOT_EXACT_BAND_G = 0.1        # wing nodes this close (in g) to the junction use the exact intersection at their xsi
+
+
+def _exact_root_g(wp: np.ndarray, rec: np.ndarray, comps: list[dict], junctions: np.ndarray, jg0: np.ndarray,
+                  tigl: Any) -> np.ndarray:
+    """Anchor: the exact junction g at each near-root wing node's own (xsi, top); NaN for the others."""
+    out = np.full(len(wp), np.nan)
+    for i, r in enumerate(wp):
+        k = int(r["node"])
+        ci = int(rec["comp"][k])
+        jsel = np.where((junctions["wing"] == ci) & (rec["mirror"][junctions["node"]] == 0))[0]
+        if not r["ok"] or not len(jsel):
+            continue
+        s = jsel[junctions["top"][jsel] == int(r["top"])] if (junctions["top"][jsel] == int(r["top"])).any() else jsel
+        order = np.argsort(junctions["xsi"][s])
+        xs = junctions["xsi"][s][order]
+        gj = float(np.interp(float(r["xsi"]), xs, jg0[s][order]))
+        # Exact also where the curve would EXTRAPOLATE (xsi outside its junction nodes' range): AR 7, 2026-11-07 --
+        # a lower-surface node at xsi 0.02, lower junction curve starting further aft, folded 2 triangles at the LE.
+        outside = float(r["xsi"]) < xs[0] or float(r["xsi"]) > xs[-1]
+        if float(r["g"]) - gj < ROOT_EXACT_BAND_G or (outside and float(r["g"]) - gj < ROOT_ZONE_MIN_G):
+            fus = comps[int(junctions["fuselage"][jsel[0]])]
+            try:
+                slide_junction(tigl, comps[ci], fus, {"g": gj, "xsi": float(r["xsi"]), "top": int(r["top"])})
+            except DeformationError:
+                continue                        # no intersection on this line: keep the interpolated curve
+            out[i] = slide_junction.last_g
+    return out
+
+
+def _root_stretch(rec: np.ndarray, anchor: np.ndarray, new: np.ndarray, data: Any, junctions: np.ndarray,
+                  g_target: np.ndarray, tigl0: Any, tigl1: Any, comps: list[dict]) -> dict:
+    """Wing nodes move in TiGL's own wing parameters; next to the root the spanwise coordinate is STRETCHED.
+
+    For a node at (g, xsi): gJ0 / gJ1 = the junction's g at that xsi on the anchor / target; outside a strip of
+    width W from gJ0 the node keeps its g, inside it g' = gJ1 + (g - gJ0)(gout - gJ1)/(gout - gJ0), gout = gJ0 + W.
+    This is monotone in g, so nodes keep their spanwise order (no fold) and the junction row lands on the body.
+    Moves = P1(g', xsi) - P0(g, xsi), so the anchor maps onto itself exactly. In place."""
+    if "wing_params" not in data.files:
+        raise DeformationError("anchor prepared without wing parameters; re-run prepare_anchor")
+    wp = data["wing_params"]
+    jg0 = data["junction_g"]
+    exact = ({int(n): float(g) for n, g in zip(wp["node"], data["root_g0"]) if np.isfinite(g)}
+             if "root_g0" in data.files else {})
+    zone = fallback = 0
+    for ci, comp in enumerate(comps):
+        if comp["kind"] != "wing":
+            continue
+        rows = wp[rec["comp"][wp["node"]] == ci]
+        if not len(rows):
+            continue
+        nseg = tigl1.wingGetSegmentCount(comp["index"])
+        jsel = np.where((junctions["wing"] == ci) & (rec["mirror"][junctions["node"]] == 0))[0]
+        curves = {}
+        for top in (0, 1):
+            s = jsel[junctions["top"][jsel] == top]
+            if len(s) == 0:
+                s = jsel
+            order = np.argsort(junctions["xsi"][s])
+            curves[top] = (junctions["xsi"][s][order], jg0[s][order], g_target[s][order])
+        width = ROOT_ZONE_MIN_G
+        if len(jsel):
+            width = max(width, ROOT_ZONE_FACTOR * float(np.abs(g_target[jsel] - jg0[jsel]).max()))
+        for r in rows:
+            k = int(r["node"])
+            if not r["ok"]:
+                fallback += 1
+                continue
+            g, xsi, top = float(r["g"]), float(r["xsi"]), int(r["top"])
+            g_new = g
+            if len(jsel):
+                xs, g0s, g1s = curves[top]
+                gj0, gj1 = float(np.interp(xsi, xs, g0s)), float(np.interp(xsi, xs, g1s))
+                exact0 = exact.get(k)
+                if exact0 is not None:
+                    # Next to the junction the interpolated curve is not good enough at the root corners (LE/TE),
+                    # where the intersection bends: use the exact intersection at this node's own xsi, both sides.
+                    fus = comps[int(junctions["fuselage"][jsel[0]])]
+                    probe = {"g": gj1, "xsi": xsi, "top": top}
+                    slide_junction(tigl1, comp, fus, probe)
+                    gj0, gj1 = exact0, slide_junction.last_g
+                gout = min(gj0 + width, float(nseg))
+                if g < gout and gout > gj0 and gout > gj1:
+                    g_new = gj1 + max(g - gj0, 0.0) * (gout - gj1) / (gout - gj0)
+                    zone += 1
+            shift = _wing_point(tigl1, comp["index"], g_new, xsi, top, nseg) - \
+                _wing_point(tigl0, comp["index"], g, xsi, top, nseg)
+            new[k] = anchor[k] + (_mirror(shift) if rec["mirror"][k] else shift)
+    return {"zone": zone, "fallback": fallback}
+
+
+def _wendland(r: np.ndarray) -> np.ndarray:
+    """Wendland C2 kernel on r in [0, 1] (compact support, positive definite in 3-D)."""
+    r = np.clip(r, 0.0, 1.0)
+    return (1.0 - r) ** 4 * (4.0 * r + 1.0)
+
+
+def _fuselage_follow(rec: np.ndarray, anchor: np.ndarray, new: np.ndarray, junctions: np.ndarray,
+                     comps: list[dict]) -> int:
+    """Fuselage nodes near the junction follow it: a Wendland RBF interpolates the junction nodes' moves, fades to zero
+    over a support of max(1 m, 4 x the largest move) -- gradients stay small, so the fuselage does not fold -- and each
+    moved node is put back on the fuselage loft. In place; returns the number of nodes moved."""
     if not len(junctions):
         return 0
-    jnodes = junctions["node"].astype(int)
-    total = new[jnodes] - anchor[jnodes]
-    jset = set(jnodes.tolist())
+    jn = junctions["node"].astype(int)
+    moves = new[jn] - anchor[jn]
+    big = float(np.linalg.norm(moves, axis=1).max())
+    if big < 1e-12:
+        return 0
+    support = max(1.0, 4.0 * big)
+    centres = anchor[jn]
+    phi = _wendland(np.linalg.norm(centres[:, None] - centres[None], axis=2) / support)
+    coef = np.linalg.solve(phi + 1e-10 * np.eye(len(jn)), moves)
+    jset = set(jn.tolist())
     count = 0
     for k in range(len(rec)):
-        if k in jset:
+        comp = comps[int(rec["comp"][k])]
+        if comp["kind"] != "fuselage" or k in jset:
             continue
-        ck = int(rec["comp"][k])
-        is_fuselage = comps[ck]["kind"] == "fuselage"
-        partner = (junctions["fuselage"] == ck) if is_fuselage else (junctions["wing"] == ck)
-        same_side = np.sign(anchor[jnodes, 1]) == np.sign(anchor[k, 1]) if abs(anchor[k, 1]) > 1e-9 else partner
-        sel = np.where(partner & same_side)[0]
-        if not len(sel):
+        r = np.linalg.norm(centres - anchor[k], axis=1) / support
+        if r.min() >= 1.0:
             continue
-        motion = total[sel] if is_fuselage else extra[sel]
-        radius = max(0.5, 3.0 * float(np.linalg.norm(motion, axis=1).max()))
-        dist = np.linalg.norm(anchor[jnodes[sel]] - anchor[k], axis=1)
-        dmin = float(dist.min())
-        if dmin >= radius:
+        add = _wendland(r) @ coef
+        if np.linalg.norm(add) < 1e-9:
             continue
-        w = 1.0 / np.maximum(dist, 1e-6) ** 2
-        fade = (1.0 - dmin / radius) ** 2
-        add = fade * (w[:, None] * motion).sum(0) / w.sum()
-        if np.linalg.norm(add) < 1e-9:              # nothing slid here (e.g. the anchor itself): leave it exact
-            continue
-        new[k] = _onto_component(anchor[k] + disp[k] + add, comps[ck], bool(rec["mirror"][k]))
+        new[k] = _onto_component(anchor[k] + add, comp, bool(rec["mirror"][k]))
         count += 1
     return count
 
@@ -501,8 +696,8 @@ def deform_mesh(anchor_dir: str | os.PathLike, ids: np.ndarray, xyz: np.ndarray,
     if proc.returncode != 0 or not (work / "mesh_def.su2").exists():
         raise DeformationError(f"SU2_DEF failed (exit {proc.returncode}); log {work / 'def.log'}: {log[-800:]}")
     if info["negative_volume_reported"] or (info["min_volume"] is not None and info["min_volume"] <= 0):
-        raise DeformationError(f"SU2_DEF produced inverted cells (min volume {info['min_volume']}); the design "
-                               f"is too far from the anchor mesh. Log: {work / 'def.log'}")
+        raise DesignTooFar("the volume mesh around the aircraft would turn inside out (SU2_DEF: cells with "
+                           "negative volume)", {"min_volume": info["min_volume"], "log": str(work / "def.log")})
     return (work / "mesh_def.su2").read_bytes(), info
 
 
