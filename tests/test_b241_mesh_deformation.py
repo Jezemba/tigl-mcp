@@ -159,3 +159,31 @@ def test_junction_close_to_the_wing_root_is_found():
         pytest.skip("needs cpacs/eval_baseline_reswept.xml")
     _, _, stats = md.surface_positions(GEO, md.open_cpacs(design)[1])
     assert stats["junction_residual_max_m"] < 1e-3
+
+
+def test_a_folded_surface_is_detected():
+    tris = np.array([[0, 1, 2], [0, 2, 3]])
+    before = np.array([[0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0]], dtype=float)
+    after = before.copy()
+    after[2] = [-1.0, -1.0, 0.0]                  # node 2 slides past node 0: both triangles fold over
+    assert list(md.flipped_triangles(tris, before, before)) == []
+    assert len(md.flipped_triangles(tris, before, after)) == 2
+
+
+def test_aircraft_triangles_are_local_indices(tmp_path):
+    p = tmp_path / "m.su2"
+    p.write_text(MESH)
+    tris = md.aircraft_triangles(p, np.array([0, 1, 2, 3]))
+    assert tris.tolist() == [[0, 1, 2], [0, 2, 3]]
+
+
+@geometry
+def test_reswept_wing_junction_does_not_fold_the_surface():
+    """The optimizer baseline (all wing sections re-swept, B242) slid the junction 0.72 m and folded 44 surface
+    triangles before the slide was spread to the neighbouring wing and fuselage nodes."""
+    design = Path(GEO) / "cpacs" / "eval_baseline_reswept.xml"
+    if not design.exists():
+        pytest.skip("needs cpacs/eval_baseline_reswept.xml")
+    _, _, stats = md.surface_positions(GEO, md.open_cpacs(design)[1])
+    assert stats["surface_triangles_flipped"] == 0 and stats["junction_blended_nodes"] > 0
+    assert stats["junction_slide_max_m"] > 0.5

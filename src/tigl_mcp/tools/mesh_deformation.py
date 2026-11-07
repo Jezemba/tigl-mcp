@@ -295,6 +295,7 @@ def prepare_anchor(mesh_path: str | os.PathLike, cpacs_path: str | os.PathLike, 
     junction_xyz = np.array([slide_junction(handle[1], comps[int(j["wing"])], comps[int(j["fuselage"])], j)[0]
                              for j in junctions]).reshape(-1, 3)
     np.savez(out / MAP_FILE, ids=ids, rec=rec, anchor_xyz=points[ids], junctions=junctions, junction_xyz=junction_xyz,
+             tris=aircraft_triangles(out / MESH_FILE, ids),
              comp_names=np.array([c["name"] for c in comps]), face_counts=np.array([len(c["surfaces"]) for c in comps]))
     meta = {"nelem": nelem, "npoin": int(len(points)), "aircraft_nodes": int(len(ids)),
             "junction_nodes": int(len(junctions)), "map_distance_max_m": float(rec["dist"].max()),
@@ -304,7 +305,8 @@ def prepare_anchor(mesh_path: str | os.PathLike, cpacs_path: str | os.PathLike, 
     return meta
 
 
-def surface_positions(anchor_dir: str | os.PathLike, target_tigl: Any) -> tuple[np.ndarray, np.ndarray, dict]:
+def surface_positions(anchor_dir: str | os.PathLike, target_tigl: Any,
+                      strict: bool = True) -> tuple[np.ndarray, np.ndarray, dict]:
     """(global node ids, new positions, stats) of the anchor's aircraft nodes on the target geometry."""
     d = Path(anchor_dir)
     data = np.load(d / MAP_FILE)
@@ -328,19 +330,114 @@ def surface_positions(anchor_dir: str | os.PathLike, target_tigl: Any) -> tuple[
     new = anchor + disp
 
     residual = []
-    for j, at_anchor in zip(junctions, data["junction_xyz"]):
+    extra = np.zeros((len(junctions), 3))           # each junction node's slide beyond its own wing mapping
+    for n, (j, at_anchor) in enumerate(zip(junctions, data["junction_xyz"])):
         k = int(j["node"])
         pt, res = slide_junction(target_tigl, comps[int(j["wing"])], comps[int(j["fuselage"])], j)
         shift = pt - at_anchor                      # in the unmirrored frame
         new[k] = anchor[k] + (_mirror(shift) if rec["mirror"][k] else shift)
+        extra[n] = new[k] - (anchor[k] + disp[k])
         residual.append(res)
+    blended = _spread_junction_slide(rec, anchor, new, disp, junctions, extra, comps)
+
+    tris = data["tris"] if "tris" in data.files else aircraft_triangles(d / MESH_FILE, ids)
+    flipped = flipped_triangles(tris, anchor, new)
     moved = np.linalg.norm(new - anchor, axis=1)
     stats = {"surface_nodes": int(len(ids)), "surface_displacement_max_m": float(moved.max()),
              "surface_displacement_mean_m": float(moved.mean()), "cap_nodes": int(on_cap.sum()),
              "junction_nodes": int(len(junctions)),
-             "junction_residual_max_m": float(max(residual)) if residual else 0.0}
+             "junction_residual_max_m": float(max(residual)) if residual else 0.0,
+             "junction_slide_max_m": float(np.linalg.norm(extra, axis=1).max()) if len(extra) else 0.0,
+             "junction_blended_nodes": blended, "surface_triangles_flipped": int(len(flipped))}
     del anchor_handle
+    stats["_flipped"] = flipped.tolist()       # for diagnosis; removed from the reply below
+    if strict and len(flipped):
+        raise DeformationError(f"the deformed aircraft surface folds: {len(flipped)} of {len(tris)} surface "
+                               f"triangles flip (largest junction slide {stats['junction_slide_max_m']:.3f} m); "
+                               "the design is too far from the anchor mesh")
     return ids, new, stats
+
+
+def _spread_junction_slide(rec: np.ndarray, anchor: np.ndarray, new: np.ndarray, disp: np.ndarray,
+                           junctions: np.ndarray, extra: np.ndarray, comps: list[dict]) -> int:
+    """Spread the junction slide to nearby nodes of the same wing and of the fuselage, then put them back on their
+    own (morphed) surface. Without it a junction node slides past its fixed neighbours and the surface folds
+    (2026-11-06: 0.72 m slide on the re-swept wing -> 44 flipped surface triangles). In place; returns the count."""
+    # Two motions reach the neighbours (2026-11-06 fold diagnosis): wing nodes near the root get the junction's EXTRA
+    # slide (they already follow the wing mapping); FUSELAGE nodes near the junction get the junction nodes' TOTAL
+    # move -- the wing root itself moves 0.45-0.7 m along the body when the inboard sections are re-swept or the
+    # root chord changes, and a fixed fuselage row next to it folds (13-43 flipped triangles from the mapping alone).
+    if not len(junctions):
+        return 0
+    jnodes = junctions["node"].astype(int)
+    total = new[jnodes] - anchor[jnodes]
+    jset = set(jnodes.tolist())
+    count = 0
+    for k in range(len(rec)):
+        if k in jset:
+            continue
+        ck = int(rec["comp"][k])
+        is_fuselage = comps[ck]["kind"] == "fuselage"
+        partner = (junctions["fuselage"] == ck) if is_fuselage else (junctions["wing"] == ck)
+        same_side = np.sign(anchor[jnodes, 1]) == np.sign(anchor[k, 1]) if abs(anchor[k, 1]) > 1e-9 else partner
+        sel = np.where(partner & same_side)[0]
+        if not len(sel):
+            continue
+        motion = total[sel] if is_fuselage else extra[sel]
+        radius = max(0.5, 3.0 * float(np.linalg.norm(motion, axis=1).max()))
+        dist = np.linalg.norm(anchor[jnodes[sel]] - anchor[k], axis=1)
+        dmin = float(dist.min())
+        if dmin >= radius:
+            continue
+        w = 1.0 / np.maximum(dist, 1e-6) ** 2
+        fade = (1.0 - dmin / radius) ** 2
+        add = fade * (w[:, None] * motion).sum(0) / w.sum()
+        if np.linalg.norm(add) < 1e-9:              # nothing slid here (e.g. the anchor itself): leave it exact
+            continue
+        new[k] = _onto_component(anchor[k] + disp[k] + add, comps[ck], bool(rec["mirror"][k]))
+        count += 1
+    return count
+
+
+def _onto_component(p: np.ndarray, comp: dict, mirrored: bool) -> np.ndarray:
+    """Nearest point of a component loft (in the node's own frame)."""
+    q = _mirror(p) if mirrored else p
+    near = [s for s, b in zip(comp["surfaces"], comp["boxes"])
+            if not (np.any(q < b[:3] - 1.0) or np.any(q > b[3:] + 1.0))] or comp["surfaces"]
+    best, best_pt = np.inf, q
+    for surf in near:
+        hit = _project(q, surf)
+        if hit is not None and hit[0] < best:
+            pt = surf.Value(hit[1], hit[2])
+            best, best_pt = hit[0], np.array([pt.X(), pt.Y(), pt.Z()])
+    return _mirror(best_pt) if mirrored else best_pt
+
+
+def aircraft_triangles(mesh_path: str | os.PathLike, ids: np.ndarray) -> np.ndarray:
+    """The aircraft marker's triangles as indices into ids."""
+    local = {int(g): i for i, g in enumerate(ids)}
+    tris = []
+    with open(mesh_path) as fh:
+        lines = iter(fh)
+        for line in lines:
+            if line.strip() == f"MARKER_TAG= {AIRCRAFT_MARKER}":
+                n = int(next(lines).split("=")[1])
+                for _ in range(n):
+                    t = next(lines).split()
+                    tris.append([local[int(t[1])], local[int(t[2])], local[int(t[3])]])
+                break
+    return np.array(tris, dtype=int).reshape(-1, 3)
+
+
+def flipped_triangles(tris: np.ndarray, before: np.ndarray, after: np.ndarray) -> np.ndarray:
+    """Indices of surface triangles whose normal reversed (the surface folded)."""
+    if not len(tris):
+        return np.array([], dtype=int)
+
+    def normals(x):
+        return np.cross(x[tris[:, 1]] - x[tris[:, 0]], x[tris[:, 2]] - x[tris[:, 0]])
+
+    return np.where((normals(before) * normals(after)).sum(1) <= 0.0)[0]
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -413,6 +510,7 @@ def deformed_mesh_for(target_tigl: Any, anchor_dir: str | os.PathLike) -> tuple[
     """The anchor mesh deformed to target_tigl's geometry, and the statistics for the tool reply."""
     meta = json.loads((Path(anchor_dir) / META_FILE).read_text())
     ids, xyz, stats = surface_positions(anchor_dir, target_tigl)
+    stats.pop("_flipped", None)
     mesh, info = deform_mesh(anchor_dir, ids, xyz)
     stats.update(info)
     stats.update({"mesh_mode": "deformed_from_anchor", "anchor_dir": str(anchor_dir),
