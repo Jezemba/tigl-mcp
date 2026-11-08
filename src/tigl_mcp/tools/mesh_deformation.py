@@ -321,6 +321,7 @@ def slide_junction(tigl: Any, wing: dict, fus: dict, j: np.void, search: float =
     # onto itself (an anchor must be prepared with the same version of this function that deforms from it).
     g0 = float(j["g"])
     f0 = f(g0)
+    slide_junction.last_overhang = 0.0
     if f0 == 0.0:
         slide_junction.last_g = g0
         return _wing_point(tigl, wing["index"], g0, float(j["xsi"]), int(j["top"]), nseg), 0.0
@@ -338,6 +339,14 @@ def slide_junction(tigl: Any, wing: dict, fus: dict, j: np.void, search: float =
                 (lo, flo), (hi, fhi) = ((g, fg), (g0, f0)) if g < g0 else ((g0, f0), (g, fg))
                 break
         d *= 1.5
+    if lo is None and f0 > 0.0 and g0 <= ROOT_OVERHANG_MAX_G0:
+        # The spanwise line no longer reaches the fuselage: the wing's root end itself lies OUTSIDE the body. Seen
+        # (envelope 2026-11-07) at the vertical tail's trailing edge, which the morph scales rearward past the
+        # tapering tail cone (3-73 mm). The node goes to the root end (g = 0), the closest the wing gets to the
+        # body; the surface stays closed and the overhang is reported (Jessica: fix the tails, do not refuse).
+        slide_junction.last_g = 0.0
+        slide_junction.last_overhang = float(f(0.0))
+        return _wing_point(tigl, wing["index"], 0.0, float(j["xsi"]), int(j["top"]), nseg), 0.0
     if lo is None:
         name = wing["name"].split(":")[-1]
         raise DesignTooFar(f"the root of {name} no longer meets the fuselage where the baseline mesh joins them",
@@ -350,6 +359,7 @@ def slide_junction(tigl: Any, wing: dict, fus: dict, j: np.void, search: float =
 
 SLIDE_TOL_M = 1e-7          # = the solid classifier's tolerance: the distance cannot be resolved more finely
 SLIDE_TOL_G = 1e-12
+ROOT_OVERHANG_MAX_G0 = 0.1   # only junctions at the wing's root end (anchor g <= this) may fall back to the root end
 
 
 def _illinois(f: Any, lo: float, flo: float, hi: float, fhi: float, maxiter: int = 100) -> float:
@@ -383,6 +393,7 @@ def _illinois(f: Any, lo: float, flo: float, hi: float, fhi: float, maxiter: int
 
 
 slide_junction.last_g = 0.0
+slide_junction.last_overhang = 0.0              # > 0: the root end lies this far outside the body (no crossing)
 
 
 _WING_PARAM_DTYPE = [("node", "i4"), ("g", "f8"), ("xsi", "f8"), ("top", "i1"), ("ok", "i1")]
@@ -484,10 +495,12 @@ def surface_positions(anchor_dir: str | os.PathLike, target_tigl: Any,
     # The wing-body junction on the target: each junction node's intersection with the fuselage, by spanwise g.
     residual = []
     g_target = np.zeros(len(junctions))
+    overhang = []
     for n, j in enumerate(junctions):
         _, res = slide_junction(target_tigl, comps[int(j["wing"])], comps[int(j["fuselage"])], j)
         g_target[n] = slide_junction.last_g
         residual.append(res)
+        overhang.append(slide_junction.last_overhang)
     root = _root_stretch(rec, anchor, new, data, junctions, g_target, anchor_handle[1], target_tigl, comps)
     # Cap nodes follow their (now final) curved neighbours.
     for i in np.where(on_cap)[0]:
@@ -505,12 +518,18 @@ def surface_positions(anchor_dir: str | os.PathLike, target_tigl: Any,
              "surface_displacement_mean_m": float(moved.mean()), "cap_nodes": int(on_cap.sum()),
              "junction_nodes": int(len(junctions)),
              "junction_residual_max_m": float(max(residual)) if residual else 0.0,
+             "junction_overhang_nodes": int(sum(o > 0 for o in overhang)),
+             "junction_overhang_max_m": float(max(overhang)) if overhang else 0.0,
              "junction_move_max_m": float(jmove.max()), "root_zone_nodes": root["zone"],
              "wing_param_fallback_nodes": root["fallback"], "fuselage_nodes_following_junction": fus_moved,
              "surface_triangles_flipped": int(len(flipped))}
+    tri_area = _triangle_areas(tris, anchor)
+    flipped_area = float(tri_area[np.asarray(flipped, dtype=int)].sum()) if len(flipped) else 0.0
+    stats["surface_flipped_area_m2"] = round(flipped_area, 5)
+    stats["surface_flipped_area_fraction"] = flipped_area / float(tri_area.sum())
     del anchor_handle
     stats["_flipped"] = flipped.tolist()       # for diagnosis; removed from the reply below
-    if strict and len(flipped):
+    if strict and stats["surface_flipped_area_fraction"] > FOLD_AREA_TOLERANCE_FRACTION:
         # Name the component whose junction folds (nearest junction node to the folded triangles): a tail change
         # folds at the TAIL root, and "the wing root" would send the agent to the wrong component.
         name, move = _folding_component(tris[np.asarray(flipped, dtype=int)], anchor, new, junctions, comps)
@@ -521,6 +540,17 @@ def surface_positions(anchor_dir: str | os.PathLike, target_tigl: Any,
                             "junction_move_max_m": round(move, 3),
                             "surface_displacement_max_m": round(stats["surface_displacement_max_m"], 3)})
     return ids, new, stats
+
+
+# Jessica 2026-11-07 ("Allow + report"): 1-2 sliver triangles (~1 m x 1-2 cm, <= 0.017 m^2, <= 0.0023 % of the
+# 706 m^2 surface) at a tail root turn over whenever the root moves 0.4-1.4 m against its fixed neighbours, for
+# any smooth field; SU2_DEF keeps every volume cell valid. Up to this fraction of the surface may turn over (it is
+# reported); more is refused. The v4 junction (43-44 folded triangles) moved CD 2.5 % -- far above this.
+FOLD_AREA_TOLERANCE_FRACTION = 1e-4
+
+
+def _triangle_areas(tris: np.ndarray, xyz: np.ndarray) -> np.ndarray:
+    return 0.5 * np.linalg.norm(np.cross(xyz[tris[:, 1]] - xyz[tris[:, 0]], xyz[tris[:, 2]] - xyz[tris[:, 0]]), axis=1)
 
 
 def _folding_component(tris: np.ndarray, anchor: np.ndarray, new: np.ndarray, junctions: np.ndarray,
@@ -629,6 +659,10 @@ def _root_stretch(rec: np.ndarray, anchor: np.ndarray, new: np.ndarray, data: An
     return {"zone": zone, "fallback": fallback}
 
 
+FUSELAGE_SUPPORT_MIN_M = 1.0      # fuselage-follow RBF reach: at least this ...
+FUSELAGE_SUPPORT_FACTOR = 4.0     # ... and this many times the largest junction move
+
+
 def _wendland(r: np.ndarray) -> np.ndarray:
     """Wendland C2 kernel on r in [0, 1] (compact support, positive definite in 3-D)."""
     r = np.clip(r, 0.0, 1.0)
@@ -647,7 +681,7 @@ def _fuselage_follow(rec: np.ndarray, anchor: np.ndarray, new: np.ndarray, junct
     big = float(np.linalg.norm(moves, axis=1).max())
     if big < 1e-12:
         return 0
-    support = max(1.0, 4.0 * big)
+    support = max(FUSELAGE_SUPPORT_MIN_M, FUSELAGE_SUPPORT_FACTOR * big)
     centres = anchor[jn]
     phi = _wendland(np.linalg.norm(centres[:, None] - centres[None], axis=2) / support)
     coef = np.linalg.solve(phi + 1e-10 * np.eye(len(jn)), moves)

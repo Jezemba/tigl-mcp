@@ -261,3 +261,35 @@ def test_anchor_from_another_junction_procedure_is_a_tool_failure(tmp_path):
     with pytest.raises(md.DeformationError, match="re-run `prepare`") as info:
         md.surface_positions(tmp_path, None)
     assert not isinstance(info.value, md.DesignTooFar)
+
+
+def test_triangle_areas():
+    tris = np.array([[0, 1, 2]])
+    xyz = np.array([[0, 0, 0], [2, 0, 0], [0, 3, 0]], dtype=float)
+    assert md._triangle_areas(tris, xyz).tolist() == [3.0]
+
+
+def test_fold_tolerance_is_a_small_fraction_of_the_surface():
+    """Allow + report (Jessica 2026-11-07): the measured tail slivers (<= 0.0023 %) pass, 43-44 junction folds do not."""
+    assert 2.3e-5 < md.FOLD_AREA_TOLERANCE_FRACTION <= 1e-4
+
+
+@geometry
+@pytest.mark.parametrize("design", ["h_sw15", "v_area1p6"])
+def test_tail_root_slivers_are_allowed_and_reported(design):
+    path = Path(GEO).parent / "deform_wide" / "cpacs" / f"{design}.xml"
+    if not path.exists():
+        pytest.skip(f"needs {path}")
+    _, _, stats = md.surface_positions(GEO, md.open_cpacs(path)[1])
+    assert stats["surface_triangles_flipped"] >= 1
+    assert 0 < stats["surface_flipped_area_fraction"] <= md.FOLD_AREA_TOLERANCE_FRACTION
+
+
+@geometry
+def test_vertical_tail_root_overhang_is_followed_not_refused():
+    path = Path(GEO).parent / "deform_wide" / "cpacs" / "v_area1p3.xml"
+    if not path.exists():
+        pytest.skip(f"needs {path}")
+    _, _, stats = md.surface_positions(GEO, md.open_cpacs(path)[1])
+    assert stats["junction_overhang_nodes"] > 0 and stats["junction_overhang_max_m"] < 0.01
+    assert stats["surface_triangles_flipped"] == 0
