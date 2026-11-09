@@ -15,10 +15,9 @@ pytest.importorskip("tigl3")
 
 from tigl_mcp.session_manager import SessionManager  # noqa: E402
 from tigl_mcp.tools.cpacs_io import open_cpacs_tool  # noqa: E402
-from tigl_mcp.tools.parameters import set_high_level_parameters_tool  # noqa: E402
+from tigl_mcp.tools.parameters import get_high_level_parameters_tool, set_high_level_parameters_tool  # noqa: E402
 
 CPACS = Path(__file__).parent / "fixtures" / "D150_simple.xml"
-AREA, AR, SWEEP = 122.8287, 9.3632, 21.6502  # D150 Wing1 as measured
 
 pytestmark = pytest.mark.integration_real
 
@@ -35,6 +34,9 @@ class Wing:
             pytest.skip("native TiGL runtime not available")
         self.uid = uid
         self.tool = set_high_level_parameters_tool(self.sm)
+        self.base = get_high_level_parameters_tool(self.sm).handler(
+            {"session_id": self.sid, "component_uid": uid}
+        )["parameters"]
 
     def morph(self, **updates: float) -> dict:
         result = self.tool.handler({"session_id": self.sid, "component_uid": self.uid, "updates": updates})
@@ -53,20 +55,23 @@ def test_the_same_request_three_times_gives_the_same_wing() -> None:
     for _ in range(3):
         morph = wing.morph(area=130.0, aspect_ratio=10.5)
         assert morph["targets_met"] is True
-        _is(morph["after"], 130.0, 10.5, SWEEP)
+        _is(morph["after"], 130.0, 10.5, wing.base["sweep"])
 
 
 def test_the_wings_own_values_leave_it_unchanged() -> None:
-    morph = Wing().morph(area=AREA, aspect_ratio=AR, sweep=SWEEP)
-    _is(morph["after"], AREA, AR, SWEEP)
+    wing = Wing()
+    area, ar, sweep = wing.base["area"], wing.base["aspect_ratio"], wing.base["sweep"]
+    morph = wing.morph(area=area, aspect_ratio=ar, sweep=sweep)
+    _is(morph["after"], area, ar, sweep)
     assert morph["after"]["span"] == pytest.approx(morph["before"]["span"], rel=1e-4)
     assert morph["after"]["taper_ratio"] == pytest.approx(morph["before"]["taper_ratio"], rel=1e-6)
 
 
 def test_one_key_changes_only_that_key() -> None:
     wing = Wing()
-    _is(wing.morph(area=130.0)["after"], 130.0, AR, SWEEP)
-    _is(wing.morph(aspect_ratio=10.5)["after"], 130.0, 10.5, SWEEP)
+    ar, sweep = wing.base["aspect_ratio"], wing.base["sweep"]
+    _is(wing.morph(area=130.0)["after"], 130.0, ar, sweep)
+    _is(wing.morph(aspect_ratio=10.5)["after"], 130.0, 10.5, sweep)
     _is(wing.morph(sweep=25.0)["after"], 130.0, 10.5, 25.0)
 
 
@@ -84,7 +89,7 @@ def test_a_sweep_change_keeps_the_kink_and_the_planform() -> None:
     morph = wing.morph(sweep=28.0)
     native = wing.sm.get(wing.sid)[1]._tigl_handle
     after = [native.wingGetChordPoint(1, seg, 1.0, 0.0) for seg in (1, 2, 3)]
-    _is(morph["after"], AREA, AR, 28.0)
+    _is(morph["after"], wing.base["area"], wing.base["aspect_ratio"], 28.0)
     assert morph["after"]["taper_ratio"] == pytest.approx(morph["before"]["taper_ratio"], rel=1e-6)
     # A shear: each section moves aft in proportion to how far out it is, so the panels stay straight and distinct.
     moved = [(a[0] - b[0]) / (b[1] - root[1]) for a, b in zip(after, before)]
@@ -107,8 +112,9 @@ def test_the_tails_hold_their_sweep_too(uid: str) -> None:
 
 
 def test_a_relative_update_is_relative_to_the_measured_geometry() -> None:
-    morph = Wing().morph(area="+5")  # type: ignore[arg-type]
-    assert morph["after"]["reference_area"] == pytest.approx(AREA + 5.0, rel=2e-4)
+    wing = Wing()
+    morph = wing.morph(area="+5")  # type: ignore[arg-type]
+    assert morph["after"]["reference_area"] == pytest.approx(wing.base["area"] + 5.0, rel=2e-4)
 
 
 def test_a_fuselage_call_does_not_replay_an_earlier_request() -> None:
