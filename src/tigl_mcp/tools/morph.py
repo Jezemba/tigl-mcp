@@ -13,9 +13,10 @@ Mechanism (validated on the D150):
      ``CCPACSConfigurationManager.get_instance().get_configuration(handle_index)``.
   2. Scale the component transformation (wing: x=chord, y=span, z=thickness —
      span ∝ y, reference_area ∝ x·y, exact; fuselage: x=length, y·z=diameter),
-     set positioning sweep, then ``WriteCPACS`` back to TiXI and **reopen a fresh
-     TiGL handle** (the C-API caches ``wingGetReferenceArea`` and ``Invalidate``
-     does not bust it). Swap the fresh handle into the session.
+     then ``WriteCPACS`` back to TiXI and **reopen a fresh TiGL handle** (the C-API
+     caches ``wingGetReferenceArea`` and ``Invalidate`` does not bust it). Swap the
+     fresh handle into the session. A wing's quarter-chord sweep is then set by
+     shearing its positionings, and the targets are re-measured until met.
   3. Report the MEASURED geometry (wings: symmetry-aware full-planform area, so
      aviary's AREA / ASPECT_RATIO map directly; fuselage: BREP bounding box,
      avoiding the segfaulting native fuselage queries).
@@ -35,6 +36,11 @@ from tigl_mcp.errors import MCPError, raise_component_not_found, raise_mcp_error
 from tigl_mcp.session_manager import SessionManager
 from tigl_mcp.tooling import ToolDefinition, ToolParameters
 from tigl_mcp.tools.common import require_session
+
+# Avion B252: how closely a wing morph must reach its targets, and how many scale + shear passes it may take.
+_AREA_AR_TOL = 1e-4
+_SWEEP_TOL_DEG = 0.01
+_MORPH_PASSES = 5
 
 
 class MorphWingParams(ToolParameters):
@@ -98,16 +104,30 @@ def _measure(
     }
 
 
-def _apply_sweep(wing: Any, sweep_deg: float) -> None:
-    """Set a uniform sweep angle on every positioning (best effort)."""
-    positionings = _call_first(wing, ["get_positionings", "getPositionings"])
-    count = _call_first(positionings, ["get_positioning_count", "getPositioningCount"])
-    for i in range(1, int(count) + 1):
-        pos = _call_first(positionings, ["get_positioning", "getPositioning"], i)
-        try:
-            _call_first(pos, ["set_sweep_angle", "SetSweepAngle"], sweep_deg)
-        except AttributeError:
-            pass
+def _shear_positionings(tixi: Any, wing_uid: str, shear: float) -> None:
+    """Shear the wing in its own axes: every section moves aft by ``shear`` x its spanwise position.
+
+    Only the positionings change, so span, area, chords and taper stay as they are and a kinked planform
+    keeps its kink (Avion B136: writing one sweep angle to every positioning erased the 0 deg inboard panel
+    and reshaped the wing). A positioning is length L, sweep s, dihedral d, spanning
+    dx = L sin s, dy = L cos s cos d, dz = L cos s sin d. TiGL's Python API has setters but no getters for
+    these, so they are read and written in the CPACS document; the caller reopens TiGL from it.
+    """
+    base = f"{tixi.uIDGetXPath(wing_uid)}/positionings"
+    for i in range(1, int(tixi.getNamedChildrenCount(base, "positioning")) + 1):
+        path = f"{base}/positioning[{i}]"
+        length = tixi.getDoubleElement(f"{path}/length")
+        sweep = math.radians(tixi.getDoubleElement(f"{path}/sweepAngle"))
+        dihedral = math.radians(tixi.getDoubleElement(f"{path}/dihedralAngle"))
+        dx = length * math.sin(sweep)
+        dy = length * math.cos(sweep) * math.cos(dihedral)
+        dz = length * math.cos(sweep) * math.sin(dihedral)
+        if abs(dy) < 1e-12:
+            continue  # a section with no spanwise offset does not move under a shear
+        dx += shear * dy
+        tixi.updateDoubleElement(f"{path}/length", math.sqrt(dx**2 + dy**2 + dz**2), "%.12g")
+        # The dihedral angle is unchanged: dy and dz keep their ratio.
+        tixi.updateDoubleElement(f"{path}/sweepAngle", math.degrees(math.atan2(dx, math.hypot(dy, dz))), "%.12g")
 
 
 def _fuselage_dims(tigl: Any, fuselage_uid: str) -> dict[str, float | None]:
@@ -187,58 +207,80 @@ def apply_wing_morph(
         cfg_mod,
         ["CCPACSConfigurationManager_get_instance", "CCPACSConfigurationManager.get_instance"],
     )
-    cpacs_config = mgr.get_configuration(native._handle.value)
-    wing = _call_first(cpacs_config, ["get_wing", "getWing"], component.uid)
+
+    def wing_scaling() -> tuple[Any, Any, Any]:
+        """The live configuration, its transformation and current scaling (the handle changes on reopen)."""
+        cpacs_config = mgr.get_configuration(native._handle.value)
+        wing = _call_first(cpacs_config, ["get_wing", "getWing"], component.uid)
+        transformation = _call_first(wing, ["get_transformation", "getTransformation"])
+        return cpacs_config, transformation, _call_first(transformation, ["get_scaling", "getScaling"])
 
     sym_factor = 2.0 if component.symmetry else 1.0
     before = _measure(native, component.uid, component.index, sym_factor)
-    cur_span = float(before["span"])
-    cur_area = float(before["reference_area"])
-    cur_ar = (cur_span**2) / cur_area if cur_area else 0.0
 
-    target_area = target_area_m2 if target_area_m2 is not None else cur_area
-    target_ar = target_aspect_ratio if target_aspect_ratio is not None else cur_ar
+    # Avion B252: what the caller did not ask to change is held at its measured value. A change of aspect
+    # ratio scales chord and span differently, which on its own would shear the wing and lower its sweep.
+    target_area = target_area_m2 if target_area_m2 is not None else float(before["reference_area"])
+    target_ar = target_aspect_ratio if target_aspect_ratio is not None else float(before["aspect_ratio"] or 0.0)
+    target_sweep = target_sweep_deg if target_sweep_deg is not None else before.get("sweep_deg")
 
-    target_span = math.sqrt(target_ar * target_area)
-    span_ratio = target_span / cur_span if cur_span else 1.0
-    area_ratio = target_area / cur_area if cur_area else 1.0
-    y_ratio = span_ratio
-    x_ratio = area_ratio / span_ratio if span_ratio else 1.0
+    def missed(m: dict[str, float | None]) -> dict[str, bool]:
+        return {
+            "scale": abs(float(m["reference_area"]) / target_area - 1.0) > _AREA_AR_TOL
+            or abs(float(m["aspect_ratio"]) / target_ar - 1.0) > _AREA_AR_TOL,
+            "sweep": target_sweep is not None and m.get("sweep_deg") is not None
+            and abs(float(m["sweep_deg"]) - float(target_sweep)) > _SWEEP_TOL_DEG,
+        }
 
-    transformation = _call_first(wing, ["get_transformation", "getTransformation"])
-    cur = _call_first(transformation, ["get_scaling", "getScaling"])
-    _call_first(
-        transformation,
-        ["set_scaling", "setScaling"],
-        geom_mod.CTiglPoint(cur.x * x_ratio, cur.y * y_ratio, cur.z * x_ratio),
-    )
-    if target_sweep_deg is not None:
-        _apply_sweep(wing, target_sweep_deg)
-
+    # Scaling and shearing each move the other's measurement slightly (the wing is rotated in its incidence and
+    # scaling is along its own axes), so measure after each and repeat until every target is met.
+    after = before
     try:
-        _call_first(cpacs_config, ["invalidate", "Invalidate"])
-    except AttributeError:
-        pass
-    uid = _call_first(cpacs_config, ["get_uid", "GetUID"])
-    _call_first(cpacs_config, ["write_cpacs", "WriteCPACS"], uid)
-
-    try:
-        native = _reopen_handle(tixi_handle, tigl_handle, native)
+        for _ in range(_MORPH_PASSES):
+            miss = missed(after)
+            if not (miss["scale"] or miss["sweep"]):
+                break
+            if miss["scale"]:
+                span_ratio = math.sqrt(target_ar * target_area) / float(after["span"])
+                area_ratio = target_area / float(after["reference_area"])
+                x_ratio = area_ratio / span_ratio
+                cpacs_config, transformation, cur = wing_scaling()
+                _call_first(
+                    transformation,
+                    ["set_scaling", "setScaling"],
+                    geom_mod.CTiglPoint(cur.x * x_ratio, cur.y * span_ratio, cur.z * x_ratio),
+                )
+                try:
+                    _call_first(cpacs_config, ["invalidate", "Invalidate"])
+                except AttributeError:
+                    pass
+                _call_first(cpacs_config, ["write_cpacs", "WriteCPACS"], _call_first(cpacs_config, ["get_uid", "GetUID"]))
+                native = _reopen_handle(tixi_handle, tigl_handle, native)
+                after = _measure(native, component.uid, component.index, sym_factor)
+            if missed(after)["sweep"]:
+                # World tan(sweep) = (scale x / scale y) x local tan(sweep), so a local shear k adds k x sx / sy.
+                _, _, cur = wing_scaling()
+                change = math.tan(math.radians(float(target_sweep))) - math.tan(math.radians(float(after["sweep_deg"])))
+                _shear_positionings(tixi_handle._tixi_handle, component.uid, change * cur.y / cur.x)
+                native = _reopen_handle(tixi_handle, tigl_handle, native)
+                after = _measure(native, component.uid, component.index, sym_factor)
     except Exception as exc:  # noqa: BLE001
         after = _measure(native, component.uid, component.index, sym_factor)
         return {"wing_uid": component.uid, "requested": requested, "before": before,
                 "after": after, "rebuilt": False,
-                "note": f"morph applied but reopen failed ({exc})."}
+                "note": f"morph applied but rebuild failed ({exc})."}
 
-    after = _measure(native, component.uid, component.index, sym_factor)
     component.parameters["span"] = after["span"]
     component.parameters["area"] = after["reference_area"]
     if after.get("aspect_ratio") is not None:
         component.parameters["aspect_ratio"] = after["aspect_ratio"]
     if after.get("sweep_deg") is not None:
         component.parameters["sweep"] = after["sweep_deg"]
+    final_miss = missed(after)
     return {"wing_uid": component.uid, "requested": requested, "before": before,
-            "after": after, "rebuilt": True}
+            "after": after, "rebuilt": True,
+            "targets": {"area": target_area, "aspect_ratio": target_ar, "sweep_quarter_chord_deg": target_sweep},
+            "targets_met": not (final_miss["scale"] or final_miss["sweep"])}
 
 
 def apply_fuselage_morph(
@@ -345,10 +387,11 @@ def morph_wing_tool(session_manager: SessionManager) -> ToolDefinition:
         name="morph_wing",
         description=(
             "Deform a wing to hit a target reference area, aspect ratio, and/or "
-            "sweep, rebuilding the TiGL geometry so downstream meshing and CFD "
-            "reflect the change. target_area_m2 / target_aspect_ratio use the "
-            "full-planform convention (matches aviary's AREA / ASPECT_RATIO). "
-            "Returns the MEASURED geometry read back from a fresh TiGL handle."
+            "quarter-chord sweep, rebuilding the TiGL geometry so downstream meshing "
+            "and CFD reflect the change. A target you leave out is held at its current "
+            "value. target_area_m2 / target_aspect_ratio use the full-planform "
+            "convention (matches aviary's AREA / ASPECT_RATIO). Returns the MEASURED "
+            "geometry read back from a fresh TiGL handle, and targets_met."
         ),
         parameters_model=MorphWingParams,
         handler=handler,

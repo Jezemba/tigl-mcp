@@ -95,9 +95,7 @@ def _apply_update(current: float | None, update_value: float | str) -> float:
 
 _MEASURED_NOTE = {
     "wing": ("Measured from the current geometry. area, aspect_ratio and span are the full wing (both halves). "
-             "sweep is the measured quarter-chord sweep, the value set_high_level_parameters reports after a "
-             "reshape; the sweep you pass to set_high_level_parameters sets the sections' positioning angle, "
-             "so the measured value differs from it."),
+             "sweep is the quarter-chord sweep, the same quantity set_high_level_parameters takes and reports."),
     "fuselage": "Measured from the current geometry (bounding box). diameter is the larger of max_width and max_height.",
 }
 
@@ -183,26 +181,36 @@ def set_high_level_parameters_tool(session_manager: SessionManager) -> ToolDefin
             if component is None:
                 raise_component_not_found(config, params.component_uid)
             warnings: list[str] = []
+            # A relative update ("+2", "5%") is relative to the geometry as it is now.
+            measured = _measured_parameters(tigl_handle, component) or {}
+            requested: dict[str, float] = {}
             for key, value in params.updates.items():
-                current_value = component.parameters.get(key)
+                current_value = measured.get(key, component.parameters.get(key))
                 try:
-                    component.parameters[key] = _apply_update(current_value, value)
+                    requested[key] = _apply_update(current_value, value)
+                    component.parameters[key] = requested[key]
                 except MCPError:
                     raise
                 except Exception as exc:  # pragma: no cover - defensive path
                     warnings.append(f"Skipped '{key}': {exc}")
 
             # Actually DEFORM the geometry (not just record intent). When a real
-            # TiGL handle is present and this is a wing/fuselage, translate the
-            # recorded parameters into a morph + rebuild so the mesh/CFD reflect
-            # them. This closes the aero<->geometry loop without any change to
-            # the agents — they already call set_high_level_parameters.
+            # TiGL handle is present and this is a wing/fuselage, translate THIS
+            # CALL's values into a morph + rebuild so the mesh/CFD reflect them.
+            # Avion B252: the targets are only what this call asked for. Everything
+            # else is held as it is measured now; component.parameters holds earlier
+            # requests and measurements, and replaying those reshaped the wing again
+            # on every call, so the same request gave a different wing each time.
             morph_result: dict[str, object] | None = None
             type_name = (component.type_name or "").lower()
             if tigl_handle._tigl_handle is not None:
                 try:
                     if type_name == "wing":
-                        area, ar, sweep = _wing_targets(component.parameters)
+                        targets = dict(requested)
+                        if any(k in requested for k in _CHORD_KEYS):
+                            # span + root_chord + tip_chord may arrive over several calls.
+                            targets.update({k: component.parameters[k] for k in _CHORD_KEYS if k in component.parameters})
+                        area, ar, sweep = _wing_targets(targets)
                         if any(v is not None for v in (area, ar, sweep)):
                             morph_result = apply_wing_morph(
                                 tixi_handle, tigl_handle, component,
@@ -210,8 +218,13 @@ def set_high_level_parameters_tool(session_manager: SessionManager) -> ToolDefin
                                 target_aspect_ratio=ar,
                                 target_sweep_deg=sweep,
                             )
+                            if morph_result.get("targets_met") is False:
+                                warnings.append(
+                                    "The morph did not reach every target: compare geometry_morph.targets with "
+                                    "geometry_morph.after, which is the geometry you now have."
+                                )
                     elif type_name == "fuselage":
-                        length, diameter = _fuselage_targets(component.parameters)
+                        length, diameter = _fuselage_targets(requested)
                         if length is not None or diameter is not None:
                             morph_result = apply_fuselage_morph(
                                 tixi_handle, tigl_handle, component,
@@ -250,6 +263,9 @@ def set_high_level_parameters_tool(session_manager: SessionManager) -> ToolDefin
                     "before": morph_result.get("before"),
                     "after": morph_result.get("after"),
                 }
+                if "targets_met" in morph_result:
+                    result["geometry_morph"]["targets"] = morph_result["targets"]
+                    result["geometry_morph"]["targets_met"] = morph_result["targets_met"]
             return result
         except MCPError as error:
             raise error
@@ -263,9 +279,11 @@ def set_high_level_parameters_tool(session_manager: SessionManager) -> ToolDefin
         description=(
             "Update high-level design parameters for a component. For a wing or "
             "fuselage with a live TiGL runtime this now DEFORMS the geometry and "
-            "rebuilds it (wing: area/AR from span+chords, plus sweep; fuselage: "
-            "length + diameter), so downstream meshing and CFD reflect the change "
-            "— the returned geometry_morph.after holds the measured new geometry."
+            "rebuilds it (wing: area, aspect_ratio, quarter-chord sweep; fuselage: "
+            "length + diameter), so downstream meshing and CFD reflect the change. "
+            "Keys you leave out are held at their current values. The returned "
+            "geometry_morph.after holds the measured new geometry and targets_met "
+            "says whether it reached what you asked."
         ),
         parameters_model=SetParametersParams,
         handler=handler,
