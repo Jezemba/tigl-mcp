@@ -46,9 +46,10 @@ def test_the_tails_are_measured():
 def test_the_fuselage_is_measured():
     sm, sid = _session()
     p = _get(sm, sid, "Fuselage1")["parameters"]
-    assert p["length"] == pytest.approx(37.68, abs=0.05)
-    assert p["diameter"] == pytest.approx(4.15, abs=0.02)
-    assert p["max_width"] == pytest.approx(3.96, abs=0.02)
+    # Avion J2: the exact surfaces to < 1 mm (dense TiGL points 37.6445 x 3.9518 x 4.1431)
+    assert p["length"] == pytest.approx(37.6445, abs=1e-3)
+    assert p["diameter"] == pytest.approx(4.1431, abs=1e-3)
+    assert p["max_width"] == pytest.approx(3.9518, abs=1e-3)
 
 
 @pytest.mark.integration_real

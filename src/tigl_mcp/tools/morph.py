@@ -155,18 +155,18 @@ def _shape_area(shape: Any) -> float | None:
 
 
 def _fuselage_dims(tigl: Any, fuselage_uid: str) -> dict[str, float | None]:
-    """Measure fuselage length/width/height from the exported BREP bounding box,
+    """Measure fuselage length/width/height from the exported BREP's tight bounding box (Avion J2),
     avoiding the native fuselage geometry queries (``fuselageGetVolume`` /
     ``fuselageGetLength``) which segfault on some CPACS files (e.g. the D150)."""
     import os
     import tempfile
 
     try:
-        from OCC.Core.Bnd import Bnd_Box
         from OCC.Core.BRep import BRep_Builder
-        from OCC.Core.BRepBndLib import brepbndlib_Add
         from OCC.Core.BRepTools import breptools_Read
         from OCC.Core.TopoDS import TopoDS_Shape
+
+        from tigl_mcp.tools.bbox import tight_box
     except Exception:  # noqa: BLE001
         return {"length": None, "width": None, "height": None}
 
@@ -175,9 +175,8 @@ def _fuselage_dims(tigl: Any, fuselage_uid: str) -> dict[str, float | None]:
         tigl.exportFuselageBREPByUID(fuselage_uid, path)
         shape = TopoDS_Shape()
         breptools_Read(shape, path, BRep_Builder())
-        box = Bnd_Box()
-        brepbndlib_Add(shape, box)
-        xmin, ymin, zmin, xmax, ymax, zmax = box.Get()
+        # Avion J2: the exact surfaces' box (brepbndlib.Add was 4 cm long on the D150; see tools/bbox.py).
+        xmin, ymin, zmin, xmax, ymax, zmax = tight_box(shape)
         return {"length": xmax - xmin, "width": ymax - ymin, "height": zmax - zmin,
                 "surface_area": _shape_area(shape)}
     finally:

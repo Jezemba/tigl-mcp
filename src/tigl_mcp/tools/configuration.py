@@ -42,11 +42,11 @@ def _measured_bbox(native: Any, component: ComponentDefinition) -> dict[str, flo
     import tempfile
 
     try:
-        from OCC.Core.Bnd import Bnd_Box
         from OCC.Core.BRep import BRep_Builder
-        from OCC.Core.BRepBndLib import brepbndlib_Add
         from OCC.Core.BRepTools import breptools_Read
         from OCC.Core.TopoDS import TopoDS_Shape
+
+        from tigl_mcp.tools.bbox import tight_box
     except Exception:  # noqa: BLE001
         return None
     kind = (component.type_name or "").lower()
@@ -58,9 +58,8 @@ def _measured_bbox(native: Any, component: ComponentDefinition) -> dict[str, flo
         getattr(native, export)(component.uid, path)
         shape = TopoDS_Shape()
         breptools_Read(shape, path, BRep_Builder())
-        box = Bnd_Box()
-        brepbndlib_Add(shape, box)
-        xmin, ymin, zmin, xmax, ymax, zmax = box.Get()
+        # Avion J2: the exact surfaces' box, not brepbndlib.Add's tolerance-enlarged one (tools/bbox.py).
+        xmin, ymin, zmin, xmax, ymax, zmax = tight_box(shape)
     except Exception:  # noqa: BLE001
         return None
     finally:

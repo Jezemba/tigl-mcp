@@ -125,9 +125,10 @@ def test_d150_fuselage_summary_is_measured_not_stubbed():
     sm, sid = _session()
     f = get_fuselage_summary_tool(sm).handler({"session_id": sid, "fuselage_uid": "Fuselage1"})
     assert f["measured"] is True
-    assert f["length"] == pytest.approx(37.68, abs=0.05)
-    assert f["max_width"] == pytest.approx(3.96, abs=0.02) and f["max_height"] == pytest.approx(4.15, abs=0.02)
-    assert f["max_diameter"] == pytest.approx(4.15, abs=0.02)
+    # Avion J2: the exact surfaces (dense TiGL points 37.6445 x 3.9518 x 4.1431; the old loose box gave 37.684 x 3.960 x 4.149)
+    assert f["length"] == pytest.approx(37.6445, abs=1e-3)
+    assert f["max_width"] == pytest.approx(3.9518, abs=1e-3) and f["max_height"] == pytest.approx(4.1431, abs=1e-3)
+    assert f["max_diameter"] == pytest.approx(4.1431, abs=1e-3)
 
 
 @pytest.mark.integration_real

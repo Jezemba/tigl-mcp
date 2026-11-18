@@ -208,6 +208,8 @@ def components(cfg: Any) -> list[dict]:
         while exp.More():
             face = topods.Face(exp.Current())
             surf = BRep_Tool.Surface(face)
+            # Avion J2: deliberately the loose (enlarged) box -- only a pre-filter for the projection below, padded by
+            # BBOX_PAD_M; a tighter box could only drop candidate faces. Not a measurement (tools/bbox.py is).
             box = Bnd_Box()
             brepbndlib.Add(face, box)
             surfs.append(surf)
