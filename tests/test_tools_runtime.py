@@ -38,7 +38,8 @@ def test_open_and_summarize_configuration(sample_cpacs_xml: str) -> None:
 
     assert summary["wings"][0]["uid"] == "W1"
     assert summary["fuselages"][0]["uid"] == "F1"
-    assert summary["bounding_box"]["xmax"] > summary["bounding_box"]["xmin"]
+    # no TiGL runtime: no placeholder box (Avion final re-run)
+    assert summary["bounding_box"] is None and "not measured" in summary["bounding_box_note"]
 
     close_result = close_tool.handler({"session_id": session_id})
     assert close_result["success"] is True

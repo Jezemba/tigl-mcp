@@ -79,7 +79,7 @@ async def test_fastmcp_server_exposes_stubbed_export_endpoints(
             "get_component_metadata",
             {"session_id": session_id, "component_uid": "W1"},
         )
-        assert wing_metadata.data["wing_data"]["num_segments"] == 0
+        assert wing_metadata.data["wing_data"]["num_segments"] is None  # not recorded: unknown, not 0
 
         wing_summary = await client.call_tool(
             "get_wing_summary", {"session_id": session_id, "wing_uid": "W1"}

@@ -16,7 +16,7 @@ from tigl_mcp.cpacs import ComponentDefinition, TiglConfiguration
 from tigl_mcp.errors import MCPError, raise_component_not_found, raise_mcp_error
 from tigl_mcp.session_manager import SessionManager
 from tigl_mcp.tooling import ToolDefinition, ToolParameters
-from tigl_mcp.tools.common import format_bounding_box, require_session
+from tigl_mcp.tools.common import require_session
 
 MeshFormat = Literal["stl", "vtk", "collada", "su2"]
 
@@ -353,8 +353,12 @@ def export_component_mesh_tool(session_manager: SessionManager) -> ToolDefinitio
             result: dict[str, object] = {
                 "format": params.format,
                 "mesh_base64": mesh_base64,
-                "bounding_box": format_bounding_box(component.bounding_box),
+                "bounding_box": None,
             }
+            # Avion final re-run: this was the placeholder box made up from the component index.
+            from tigl_mcp.tools.configuration import _component_bbox
+
+            result["bounding_box"], result["bounding_box_note"] = _component_bbox(tigl_handle, component)
             tri_count = _count_stl_triangles(validated_mesh)
             if tri_count is not None:
                 result["num_triangles"] = tri_count

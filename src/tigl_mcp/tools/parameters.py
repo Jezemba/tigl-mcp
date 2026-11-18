@@ -129,10 +129,23 @@ def _measured_parameters(tigl_handle: Any, component: Any) -> dict[str, float] |
                    "diameter": max(w, h) if w is not None and h is not None else None}
         else:
             return None
-    except Exception:  # noqa: BLE001 - fall back to the recorded values rather than fail the call
-        return None
+    except Exception as exc:  # noqa: BLE001
+        # Avion final re-run: this used to return None, and the caller then reported the RECORDED values
+        # (earlier requests) as if they were the geometry. A live geometry that cannot be measured is an error.
+        raise_mcp_error(
+            "MeasurementError",
+            f"Could not measure {component.type_name} '{component.uid}' with TiGL, so its current geometry is "
+            "unknown; no recorded or requested values are reported in its place.",
+            str(exc),
+        )
     out = {k: float(v) for k, v in out.items() if v is not None}
-    return out or None
+    if not out:
+        raise_mcp_error(
+            "MeasurementError",
+            f"Could not measure {component.type_name} '{component.uid}': TiGL returned no values (for a fuselage, "
+            "the BREP export or OpenCASCADE was unavailable). No recorded values are reported in its place.",
+        )
+    return out
 
 
 def get_high_level_parameters_tool(session_manager: SessionManager) -> ToolDefinition:
@@ -147,9 +160,20 @@ def get_high_level_parameters_tool(session_manager: SessionManager) -> ToolDefin
                 raise_component_not_found(config, params.component_uid)
             measured = _measured_parameters(tigl_handle, component)
             if measured is None:
-                return {"component_uid": component.uid, "parameters": component.parameters}
-            return {"component_uid": component.uid, "parameters": {**component.parameters, **measured},
-                    "measured": True, "note": _MEASURED_NOTE.get((component.type_name or "").lower(), "")}
+                note = ("No TiGL runtime in this server: these are the values recorded on the component (CPACS "
+                        "attributes or earlier requests), NOT measurements."
+                        if getattr(tigl_handle, "_tigl_handle", None) is None else
+                        f"{component.type_name} geometry is not measured by this tool; these are recorded values.")
+                return {"component_uid": component.uid, "parameters": component.parameters,
+                        "measured": False, "note": note}
+            out = {"component_uid": component.uid, "parameters": measured,
+                   "measured": True, "note": _MEASURED_NOTE.get((component.type_name or "").lower(), "")}
+            # Recorded values (earlier requests) that are not measured are kept apart, never mixed in as
+            # geometry: a requested taper the morph did not apply used to read as the current taper.
+            recorded = {k: v for k, v in component.parameters.items() if k not in measured}
+            if recorded:
+                out["recorded_not_measured"] = recorded
+            return out
         except MCPError as error:
             raise error
         except Exception as exc:  # pragma: no cover - defensive path

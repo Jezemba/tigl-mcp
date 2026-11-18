@@ -112,6 +112,11 @@ def open_cpacs_tool(session_manager: SessionManager) -> ToolDefinition:
                 "session_id": session_id,
                 "cpacs_metadata": cpacs_stubs.extract_metadata(xml_content, file_name),
                 "configuration_summary": summary,
+                # Avion final re-run: say whether the tools will MEASURE this geometry or only report
+                # recorded values (no TiGL bindings in this server).
+                "geometry_runtime": ("tigl" if getattr(tigl_handle, "_tigl_handle", None) is not None else
+                                     "none: no TiGL bindings in this server; summaries report recorded values "
+                                     "only (measured: false)"),
             }
         except MCPError as error:
             raise error

@@ -130,6 +130,30 @@ def _shear_positionings(tixi: Any, wing_uid: str, shear: float) -> None:
         tixi.updateDoubleElement(f"{path}/sweepAngle", math.degrees(math.atan2(dx, math.hypot(dy, dz))), "%.12g")
 
 
+def _shape_area(shape: Any) -> float | None:
+    """Surface area of an OpenCASCADE shape (every face), or None when it cannot be computed.
+
+    Used for the fuselage wetted area (Avion F5): TiGL's Python wrapper has no fuselageGetWettedArea, so
+    get_fuselage_summary returned null in 48 of 48 l20_final calls. On the D150 the exported fuselage BREP
+    measures 417.07 m^2, identical to TiGL's fuselageGetSurfaceArea (probed 2026-11-18).
+    """
+    try:
+        from OCC.Core.GProp import GProp_GProps
+
+        try:
+            from OCC.Core.BRepGProp import brepgprop_SurfaceProperties as surface_properties
+        except ImportError:  # pythonocc >= 7.7
+            from OCC.Core.BRepGProp import brepgprop
+
+            surface_properties = brepgprop.SurfaceProperties
+        props = GProp_GProps()
+        surface_properties(shape, props)
+        area = float(props.Mass())
+    except Exception:  # noqa: BLE001 - reported as None by the caller, never a made-up value
+        return None
+    return area if area > 0 else None
+
+
 def _fuselage_dims(tigl: Any, fuselage_uid: str) -> dict[str, float | None]:
     """Measure fuselage length/width/height from the exported BREP bounding box,
     avoiding the native fuselage geometry queries (``fuselageGetVolume`` /
@@ -154,7 +178,8 @@ def _fuselage_dims(tigl: Any, fuselage_uid: str) -> dict[str, float | None]:
         box = Bnd_Box()
         brepbndlib_Add(shape, box)
         xmin, ymin, zmin, xmax, ymax, zmax = box.Get()
-        return {"length": xmax - xmin, "width": ymax - ymin, "height": zmax - zmin}
+        return {"length": xmax - xmin, "width": ymax - ymin, "height": zmax - zmin,
+                "surface_area": _shape_area(shape)}
     finally:
         try:
             os.unlink(path)

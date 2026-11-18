@@ -36,14 +36,9 @@ def read_from_cpacs(cpacs_xml: str) -> dict[str, Any]:
                 "type": comp.type_name,
                 "index": comp.index,
                 "symmetry": comp.symmetry,
-                "bounding_box": {
-                    "xmin": comp.bounding_box.xmin,
-                    "xmax": comp.bounding_box.xmax,
-                    "ymin": comp.bounding_box.ymin,
-                    "ymax": comp.bounding_box.ymax,
-                    "zmin": comp.bounding_box.zmin,
-                    "zmax": comp.bounding_box.zmax,
-                },
+                # Avion final re-run: was the placeholder box made up from the component index.
+                "bounding_box": None,
+                "bounding_box_note": "not measured (parsed from XML only)",
             }
         )
 
