@@ -69,5 +69,6 @@ def test_a_real_change_still_morphs_and_one_axis_can_be_held(tmp_path):
     assert gm["rebuilt"] is True and gm["no_op"] is False
     assert gm["tolerance"]["held_within_tolerance"] == ["diameter"] and NO_CHANGE_NOTE in gm["note"]
     assert gm["after"]["length"] == pytest.approx(38.0, abs=1e-3)
-    assert max(gm["after"]["width"], gm["after"]["height"]) == pytest.approx(f["diameter"], abs=1e-9)
+    # diameter not rescaled (the box of the longer fuselage moves by < 1 micron)
+    assert max(gm["after"]["width"], gm["after"]["height"]) == pytest.approx(f["diameter"], abs=1e-5)
     assert _export(sm, sid, tmp_path / "morphed.xml") != untouched
