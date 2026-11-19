@@ -41,6 +41,11 @@ from tigl_mcp.tools.common import require_session
 _AREA_AR_TOL = 1e-4
 _SWEEP_TOL_DEG = 0.01
 _MORPH_PASSES = 5
+# Avion V5 follow-up (2026-11-18): a fuselage request within this RELATIVE tolerance of the measured length / diameter
+# is not applied (the wing uses _AREA_AR_TOL the same way). Re-applying the measured D150 fuselage used to rescale it by
+# ~1e-6, rewrite the CPACS and change the design fingerprint, so "apply the starting design" was not a no-op.
+_FUSELAGE_TOL = 1e-4
+NO_CHANGE_NOTE = "no change: within tolerance"
 
 
 class MorphWingParams(ToolParameters):
@@ -259,6 +264,15 @@ def apply_wing_morph(
     # Scaling and shearing each move the other's measurement slightly (the wing is rotated in its incidence and
     # scaling is along its own axes), so measure after each and repeat until every target is met.
     after = before
+    if not any(missed(before).values()):
+        # Avion V5 follow-up: every target is within tolerance of the measured wing -- nothing is written.
+        return {"wing_uid": component.uid, "requested": requested, "before": before, "after": before,
+                "rebuilt": False, "no_op": True,
+                "targets": {"area": target_area, "aspect_ratio": target_ar, "sweep_quarter_chord_deg": target_sweep},
+                "targets_met": True,
+                "tolerance": {"area_aspect_ratio_relative": _AREA_AR_TOL, "sweep_deg": _SWEEP_TOL_DEG},
+                "note": f"{NO_CHANGE_NOTE} (area / aspect ratio relative {_AREA_AR_TOL:g}, sweep {_SWEEP_TOL_DEG:g} deg); "
+                        "the CPACS file and the geometry are untouched."}
     try:
         for _ in range(_MORPH_PASSES):
             miss = missed(after)
@@ -304,7 +318,8 @@ def apply_wing_morph(
     return {"wing_uid": component.uid, "requested": requested, "before": before,
             "after": after, "rebuilt": True,
             "targets": {"area": target_area, "aspect_ratio": target_ar, "sweep_quarter_chord_deg": target_sweep},
-            "targets_met": not (final_miss["scale"] or final_miss["sweep"])}
+            "targets_met": not (final_miss["scale"] or final_miss["sweep"]),
+            "no_op": False}
 
 
 def apply_fuselage_morph(
@@ -350,6 +365,20 @@ def apply_fuselage_morph(
 
     x_ratio = target_length_m / cur_len if target_length_m else 1.0
     d_ratio = target_diameter_m / cur_dia if target_diameter_m else 1.0
+    # A target within _FUSELAGE_TOL of the measured value is held (not rescaled by ~1e-6); both held = a no-op that
+    # leaves the CPACS and the geometry untouched.
+    held = [name for name, r, t in (("length", x_ratio, target_length_m), ("diameter", d_ratio, target_diameter_m))
+            if t and abs(r - 1.0) <= _FUSELAGE_TOL]
+    if "length" in held:
+        x_ratio = 1.0
+    if "diameter" in held:
+        d_ratio = 1.0
+    tolerance = {"relative": _FUSELAGE_TOL, "held_within_tolerance": held}
+    if x_ratio == 1.0 and d_ratio == 1.0:
+        return {"fuselage_uid": component.uid, "requested": requested, "before": before, "after": before,
+                "rebuilt": False, "no_op": True, "tolerance": tolerance,
+                "note": f"{NO_CHANGE_NOTE} (relative {_FUSELAGE_TOL:g} of the measured length and diameter); "
+                        "the CPACS file and the geometry are untouched."}
 
     transformation = _call_first(fuselage, ["get_transformation", "getTransformation"])
     cur = _call_first(transformation, ["get_scaling", "getScaling"])
@@ -377,8 +406,11 @@ def apply_fuselage_morph(
         component.parameters["length"] = after["length"]
     if after.get("width") is not None and after.get("height") is not None:
         component.parameters["max_diameter"] = max(after["width"], after["height"])
-    return {"fuselage_uid": component.uid, "requested": requested, "before": before,
-            "after": after, "rebuilt": True}
+    out = {"fuselage_uid": component.uid, "requested": requested, "before": before,
+           "after": after, "rebuilt": True, "no_op": False, "tolerance": tolerance}
+    if held:
+        out["note"] = f"{', '.join(held)}: {NO_CHANGE_NOTE} (held at the measured value)."
+    return out
 
 
 def morph_wing_tool(session_manager: SessionManager) -> ToolDefinition:

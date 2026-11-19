@@ -287,6 +287,9 @@ def set_high_level_parameters_tool(session_manager: SessionManager) -> ToolDefin
                     "before": morph_result.get("before"),
                     "after": morph_result.get("after"),
                 }
+                for key in ("no_op", "note", "tolerance"):
+                    if key in morph_result:
+                        result["geometry_morph"][key] = morph_result[key]
                 if "targets_met" in morph_result:
                     result["geometry_morph"]["targets"] = morph_result["targets"]
                     result["geometry_morph"]["targets_met"] = morph_result["targets_met"]
